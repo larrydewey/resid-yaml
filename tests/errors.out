@@ -1,0 +1,57 @@
+ok   grammar/bare scalar
+ok   grammar/empty value
+ok   grammar/empty key
+ok   grammar/tab indent
+ok   grammar/unclosed quote
+ok   grammar/unclosed flow
+ok   grammar/unclosed flow map
+ok   grammar/unclosed anchor
+ok   indent/too deep
+ok   indent/entry under entry
+ok   duplicate/key
+ok   duplicate/nested
+ok   tag/unknown
+ok   tag/seq on a scalar
+ok   tag/int on a word
+ok   tag/float on a word
+ok   tag/binary
+ok   tag/handle
+ok   tag/handle on a key
+ok   tag/handle undeclared
+ok   tag/directive without a handle
+ok   tag/directive without a prefix
+ok   int/one too many
+ok   int/negative one too many
+ok   int/hex too many
+ok   int/tagged too many
+ok   int/largest
+ok   int/smallest
+ok   alias/none
+ok   alias/self
+ok   field/missing
+ok   field/both
+ok   field/text where an int belongs
+ok   field/sequence where an int belongs
+ok   field/mapping where an int belongs
+ok   field/scalar where a table belongs
+ok   field/sequence where a table belongs
+ok   variant/no type
+ok   variant/unknown
+ok   variant/type not text
+ok   variant/not a table
+ok   variant/payload
+ok   variant/unit
+ok   scalars/all
+ok   scalars/number as text
+ok   scalars/wrong int
+ok   scalars/wrong list
+ok   scalars/wrong item
+ok   scalars/null where a string belongs
+ok   bare/string
+ok   bare/number
+ok   bare/sequence
+ok   bare/null
+ok   end/empty document
+ok   end/only a comment
+ok   end/a second document
+exit 0

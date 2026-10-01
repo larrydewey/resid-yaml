@@ -1,0 +1,823 @@
+// yaml.resid — YAML as a format for resid-serial.
+//
+//   yaml.resid       the format: an Encoder and a Decoder
+//   yaml_parse.resid the grammar, into a tree of nodes
+//   yaml_resolve.resid what a scalar means, given its tag
+//   yaml_text.resid  how a scalar is written
+//
+// YAML is text, and a document is a tree: block mappings and sequences
+// written with indentation, flow collections in brackets and braces, five
+// ways of writing a scalar, and tags and anchors that say what a value is.
+//
+// Decoding parses the whole document and resolves it first, then walks the
+// tree, so a field may be asked for by name in any order. Encoding walks
+// the value and writes it out, choosing between a block and a flow
+// collection as it goes.
+//
+// Representation choices, all of which round-trip through this package:
+//   struct, map      a mapping, so a map's keys have to be strings
+//   sequence         a sequence, block if it holds records and flow if not
+//   Str              a plain scalar where that reads back as this string,
+//                    and quoted where it would not
+//   Int, Float, Bool the plain scalars for them
+//   Option(T)        Some(v) is v; YAML has a null, so None is `null`
+//   Unit             `null` as well, which reads back as None, so a unit
+//                    needs a field to sit in
+//   bytes, Dec(N)    no spelling in the data model; refused
+//   Int(128)         an integer while it fits in the 64 bits an Int has
+//   variant          a mapping with a `type` key: {type: Circle, value: 3}
+//   a date-time      a string, since the data model has no date
+//   several values   `---` between them, which to_toml has no verb for
+//                    and so yaml_stream does
+
+import "yaml_resolve.resid";
+
+// ─── The document ────────────────────────────────────────────────────
+
+// A parsed and resolved document: the value, and whether it was written
+// with the `---` and `...` markers.
+pub Result(YValue, SerialError) yaml_value(Str in) {
+    Result(YDoc, SerialError) d = yaml_doc(in);
+    if (Err(e) = d) { return Err(e); }
+    if (Ok(doc) = d) { return y_resolve(doc.node); }
+    return Err(custom_error("unreachable"));
+}
+
+// Every document of a stream, in order. The format's own verbs read one
+// value, so a stream is read here.
+pub Result(List(YValue), SerialError) yaml_stream(Str in) {
+    Result(List(YDoc), SerialError) r = yaml_docs(in);
+    if (Err(e) = r) { return Err(e); }
+    if (Ok(ds) = r) { return y_stream_values(ds, 0, []); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(List(YValue), SerialError) y_stream_values(List(YDoc) ds, Int i, List(YValue) acc) {
+    if (i >= ds.len()) { return Ok(acc); }
+    Result(YValue, SerialError) v = y_resolve(ds[i].node);
+    if (Err(e) = v) { return Err(e); }
+    if (Ok(value) = v) { return y_stream_values(ds, i + 1, acc.concat([value])); }
+    return Err(custom_error("unreachable"));
+}
+
+// ─── The encoder ─────────────────────────────────────────────────────
+
+// The text written so far, as a rope of the pieces it was written in
+// rather than one string that is copied whole for every value: a document
+// of n values costs n appends of one fragment each, joined once at the
+// end.
+type YOut = YNil | YCons(YCell);
+
+type YCell = { YOut next; Str s; };
+
+// A YAML encoder: what has been written, the indentation the block being
+// written sits at, the column a block sequence's entries are written at
+// (which is its own level rather than the entry's), and whether a line is
+// open, meaning the last thing written was a `key:` or a `- ` rather than a
+// line break. A rope cannot be asked what its last character is, so that is
+// kept here.
+type YEnc = {
+    YOut out;
+    Int indent;
+    Int seq_at;
+    Bool keyed;
+    Bool open_line;
+    Bool after_key;  // the last thing written was a `key:` a value follows
+    Bool streamed;  // the code points of a string are coming, not a value
+    Str sbuf;      // what they have gathered so far
+};
+
+pub YEnc yaml_encoder() { return YEnc {.out = YNil, .indent = 0, .seq_at = 0, .keyed = false, .open_line = false, .after_key = false, .streamed = false, .sbuf = ""}; }
+
+// An encoder at a level of its own, for a block that has opened.
+YEnc y_at(YEnc e, Int indent) { return YEnc {.out = e.out, .indent = indent, .seq_at = indent, .keyed = false, .open_line = e.open_line, .after_key = false, .streamed = false, .sbuf = ""}; }
+
+// An encoder that only appends: the level a block sequence's entries are
+// written at is not its own to change.
+YEnc y_keep(YEnc e, Bool open) { return YEnc {.out = e.out, .indent = e.indent, .seq_at = e.seq_at, .keyed = e.keyed, .open_line = open, .after_key = false, .streamed = false, .sbuf = ""}; }
+
+// One more piece of the document. A piece that ends in a line break closes
+// the line it was on; a piece that is empty says nothing about it.
+YEnc y_say(YEnc e, Str s) {
+    Bool open = if (str_len(s) == 0) { e.open_line } else { !y_last_is_break(s) };
+    return YEnc {.out = YCons(YCell {.next = e.out, .s = s}), .indent = e.indent, .seq_at = e.seq_at, .keyed = e.keyed, .open_line = open, .after_key = false, .streamed = false, .sbuf = ""};
+}
+
+// A block starts on a line of its own, so a line that is still open has to
+// be closed first.
+YEnc y_newline(YEnc e) {
+    if (!e.open_line) { return e; }
+    return y_say(e, "\n");
+}
+
+Bool y_last_is_break(Str s) {
+    if (str_len(s) == 0) { return false; }
+    return str_char_at(s, str_len(s) - 1) == 10;
+}
+
+// The text of the document, joined once from the pieces it was written in.
+pub Str yaml_text(YEnc e) { return str_join(y_pieces(e.out, ListBuf()), ""); }
+
+List(Str) y_pieces(YOut o, ListBuf(Str) b) {
+    YOut got = o;
+    return match got { YNil => b.finish().reverse(), YCons(c) => y_pieces(c.next, b.push(c.s)) };
+}
+
+// A line at the current indentation.
+Str y_pad(Int n) {
+    if (n <= 0) { return ""; }
+    return "  " + y_pad(n - 1);
+}
+
+// The `---` that opens a document, and the `...` that may close it.
+YEnc y_start(YEnc e) { return y_say(e, "---\n"); }
+
+YEnc y_end_doc(YEnc e) { return y_say(e, "...\n"); }
+
+// A struct is a block mapping: its keys are written at the indentation the
+// document is at, and a value that is a collection of its own opens a block
+// one step deeper.
+// A struct is a block mapping: its keys are written at the indentation the
+// document is at, and a value that is a collection of its own opens a block
+// one step deeper. A mapping that starts on the line of a `- ` writes its
+// first key there, one space in.
+Result(YEnc, SerialError) ye_field(YEnc e, Str key) {
+    Str at = if (e.open_line) { " " } else { y_pad(e.indent) };
+    return Ok(y_key_written(y_say(e, at + y_key(key) + ":")));
+}
+
+// The value of the last key: after the `key:` or the `- ` already on the
+// line, or at this line's own indentation when there is neither.
+// The value of the last key: after the `key:` or the `- ` already on the
+// line, or at this line's own indentation when there is neither.
+Result(YEnc, SerialError) ye_scalar(YEnc e, Str text) {
+    Str at = if (e.open_line) { " " } else { y_pad(e.indent) };
+    if (e.keyed) { return Ok(y_key_written(y_say(e, at + y_key(text) + ":"))); }
+    return Ok(y_say(y_say(e, at), text + "\n"));
+}
+
+// The last thing written was a key, so a collection after it opens a block
+// of its own below.
+YEnc y_key_written(YEnc e) {
+    return YEnc {.out = e.out, .indent = e.indent, .seq_at = e.seq_at, .keyed = false, .open_line = e.open_line, .after_key = true, .streamed = false, .sbuf = ""};
+}
+
+// A block that starts where a key was expected: YAML writes those in the
+// explicit form, with `? ` on a line of its own.
+YEnc y_explicit(YEnc e, Int indent) { return y_say(YEnc {.out = e.out, .indent = indent, .seq_at = indent, .keyed = false, .open_line = true, .after_key = false, .streamed = false, .sbuf = ""}, "?"); }
+
+Result(YEnc, SerialError) ye_null(YEnc e) { return ye_scalar(e, "null"); }
+
+Result(YEnc, SerialError) ye_bool(YEnc e, Bool v) { return ye_scalar(e, if (v) { "true" } else { "false" }); }
+
+Result(YEnc, SerialError) ye_int(YEnc e, Int v) { return ye_scalar(e, f"{v}"); }
+
+Result(YEnc, SerialError) ye_uint(YEnc e, UInt(64) v) {
+    if (v > u64(9223372036854775807)) { return Err(yaml_int_range(f"{v}")); }
+    return ye_scalar(e, f"{v}");
+}
+
+// A 128-bit integer is written while it fits in the 64 bits an Int has,
+// which is checked against the 128-bit bound: converting first would be
+// the very thing that is out of range.
+Result(YEnc, SerialError) ye_i128(YEnc e, Int(128) v) {
+    if (v < i128(0 - 9223372036854775807) - 1 || v > i128(9223372036854775807)) { return Err(yaml_int_range(f"{v}")); }
+    return ye_scalar(e, f"{v}");
+}
+
+Result(YEnc, SerialError) ye_u128(YEnc e, UInt(128) v) {
+    if (v > u128(9223372036854775807)) { return Err(yaml_int_range(f"{v}")); }
+    return ye_scalar(e, f"{v}");
+}
+
+Result(YEnc, SerialError) ye_float(YEnc e, Float v) { return ye_scalar(e, y_float(v)); }
+
+Result(YEnc, SerialError) ye_str(YEnc e, Str v) { return ye_scalar(e, y_str(v)); }
+
+Result(YEnc, SerialError) ye_bytes(YEnc e, List(Int) v) { return Err(unsupported("bytes")); }
+
+Result(YEnc, SerialError) ye_bytes_begin(YEnc e, Int len) { return Err(unsupported("bytes")); }
+
+Result(YEnc, SerialError) ye_byte(YEnc e, Int b) { return Err(unsupported("bytes")); }
+
+Result(YEnc, SerialError) ye_bytes_end(YEnc e) { return Err(unsupported("bytes")); }
+
+Result(YEnc, SerialError) ye_dec(YEnc e, Str v) { return Err(unsupported("a decimal, which this format has no spelling for")); }
+
+Result(YEnc, SerialError) ye_none(YEnc e) { return ye_scalar(e, "null"); }
+
+Result(YEnc, SerialError) ye_some(YEnc e) { return Ok(e); }
+
+// A string streamed from where it lives comes a code point at a time, so it
+// is gathered until it ends and then written as a string. A Str(N) is at
+// most N code points, so this is bounded by the type.
+Result(YEnc, SerialError) ye_str_begin(YEnc e, Int chars, Int bytes) { return Ok(y_sbuf(e, "", true)); }
+
+Result(YEnc, SerialError) ye_str_char(YEnc e, Int cp) { return Ok(y_sbuf(e, e.sbuf + str_from_code(cp), true)); }
+
+Result(YEnc, SerialError) ye_str_end(YEnc e) {
+    if (!e.streamed) { return Ok(e); }
+    return ye_str(y_sbuf(e, "", false), e.sbuf);
+}
+
+YEnc y_sbuf(YEnc e, Str text, Bool streamed) {
+    return YEnc {.out = e.out, .indent = e.indent, .seq_at = e.seq_at, .keyed = e.keyed, .open_line = e.open_line, .after_key = false, .streamed = streamed, .sbuf = text};
+}
+
+// A sequence: block entries, one `- ` per line, a nested block one step
+// deeper.
+Result(YEnc, SerialError) ye_seq_begin(YEnc e, Int len) {
+    if (e.keyed) {
+        // A key that is a sequence has no block form of its own here, so
+        // the explicit form is what writes it.
+        return Ok(y_explicit(e, e.indent));
+    }
+    // An empty sequence has no entries to open a block for, so it is
+    // written as the value it is.
+    if (len == 0) { return ye_scalar(e, "[]"); }
+    // A block sequence's entries sit at the column of the key it belongs
+    // to, so the entries' own level is the one it is already at.
+    return Ok(y_at(y_newline(e), e.indent));
+}
+
+// One entry: the `- ` and the value's column, which is one step in from
+// the entry's own.
+Result(YEnc, SerialError) ye_seq_elem(YEnc e) {
+    YEnc one = y_say(YEnc {.out = e.out, .indent = e.seq_at + 1, .seq_at = e.seq_at, .keyed = false, .open_line = false, .after_key = false, .streamed = false, .sbuf = ""}, y_pad(e.seq_at));
+    return Ok(y_keep(y_say(one, "-"), true));
+}
+
+// The entries' level is restored: what follows a sequence is written at the
+// column the entries were at, not at the column inside the last one.
+Result(YEnc, SerialError) ye_seq_end(YEnc e) {
+    return Ok(YEnc {.out = e.out, .indent = e.seq_at, .seq_at = e.seq_at, .keyed = false, .open_line = false, .after_key = false, .streamed = false, .sbuf = ""});
+}
+
+// A map is a block mapping too, so it is written the same way a struct is.
+Result(YEnc, SerialError) ye_map_begin(YEnc e, Int len) {
+    if (e.keyed) { return Ok(y_explicit(e, e.indent)); }
+    if (!e.after_key) { return Ok(e); }
+    return Ok(y_at(y_newline(e), e.indent + 1));
+}
+
+// A key comes next: the framework writes it as a value of its own, so the
+// encoder has to know it is the key that is coming.
+Result(YEnc, SerialError) ye_map_key(YEnc e) { return Ok(YEnc {.out = e.out, .indent = e.indent, .seq_at = e.seq_at, .keyed = true, .open_line = e.open_line, .after_key = false, .streamed = false, .sbuf = ""}); }
+
+Result(YEnc, SerialError) ye_map_value(YEnc e) { return Ok(e); }
+
+Result(YEnc, SerialError) ye_map_end(YEnc e) { return Ok(e); }
+
+Result(YEnc, SerialError) ye_struct_begin(YEnc e, Str name, Int len) {
+    if (e.keyed) { return Ok(y_explicit(e, e.indent)); }
+    if (!e.after_key) { return Ok(e); }
+    return Ok(y_at(y_newline(e), e.indent + 1));
+}
+
+Result(YEnc, SerialError) ye_struct_end(YEnc e) { return Ok(e); }
+
+// A variant is a mapping with a `type` key, so it is written as one: the
+// tag key on a line of its own, then the payload's key with the value the
+// framework writes after it.
+// A unit variant is the tag key alone.
+Result(YEnc, SerialError) ye_unit_variant(YEnc e, Str enum_name, Int index, Str variant) {
+    Int at = if (e.open_line) { e.indent + 1 } else { e.indent };
+    return Ok(y_at(y_say(y_newline(e), y_pad(at) + "type: " + y_str(variant) + "\n"), at));
+}
+
+// A variant with a payload: the tag key, then the payload's key with the
+// value the framework writes after it.
+Result(YEnc, SerialError) ye_variant_begin(YEnc e, Str enum_name, Int index, Str variant) {
+    Int at = if (e.open_line) { e.indent + 1 } else { e.indent };
+    YEnc tag = y_at(y_say(y_newline(e), y_pad(at) + "type: " + y_str(variant) + "\n"), at);
+    return Ok(y_key_written(y_say(tag, y_pad(at) + "value:")));
+}
+
+Result(YEnc, SerialError) ye_variant_end(YEnc e) { return Ok(e); }
+
+Bool ye_human(YEnc e) { return true; }
+
+SerialError yaml_int_range(Str text) { return invalid_value(text, "a YAML integer, which is 64 bits"); }
+
+Encoder(YEnc) = {
+    .write_unit = ye_unit, .write_bool = ye_bool, .write_int = ye_int, .write_uint = ye_uint,
+    .write_i128 = ye_i128, .write_u128 = ye_u128, .write_float = ye_float, .write_str = ye_str,
+    .write_bytes = ye_bytes, .write_none = ye_none,
+    .write_str_begin = ye_str_begin, .write_str_char = ye_str_char, .write_str_end = ye_str_end,
+    .write_bytes_begin = ye_bytes_begin, .write_byte = ye_byte, .write_bytes_end = ye_bytes_end,
+    .write_seq_begin = ye_seq_begin, .write_seq_elem = ye_seq_elem, .write_seq_end = ye_seq_end,
+    .write_map_begin = ye_map_begin, .write_map_key = ye_map_key, .write_map_value = ye_map_value, .write_map_end = ye_map_end,
+    .write_struct_begin = ye_struct_begin, .write_field = ye_field, .write_struct_end = ye_struct_end,
+    .write_some = ye_some, .encodes_human_readable = ye_human, .write_unit_variant = ye_unit_variant, .write_variant_begin = ye_variant_begin, .write_variant_end = ye_variant_end
+};
+
+// is written as one and says so.
+Result(YEnc, SerialError) ye_unit(YEnc e) { return Err(unsupported("a unit value, which reads back as None")); }
+
+// ─── The decoder ─────────────────────────────────────────────────────
+
+// A resolved document, and where the decoder is in it. The root is a
+// cursor over the document's pairs, and a struct or a map pushes its own.
+type YDec = {
+    YValue root;
+    Int taken;
+    List(YFrame) open;
+    Int payloads;
+    Bool mkey;      // the next read is the key of the pair at the cursor
+    Option(YValue) mval;  // the value of the pair whose key was just read
+    Str sbuf;       // a string being pulled one code point at a time
+    Int spos;
+};
+
+type YCur = { List(YEntryV) pairs; Int pos; };
+
+type YItems = { List(YValue) items; Int pos; };
+
+type YFrame = YKeys(YCur) | YElems(YItems);
+
+pub YDec yaml_decoder(YValue root) { return YDec {.root = root, .taken = 0, .open = [], .payloads = 0, .mkey = false, .mval = None, .sbuf = "", .spos = 0}; }
+
+YDec yd_of(YValue root, Int taken, List(YFrame) open, Int payloads, Bool mkey, Option(YValue) mval) {
+    return YDec {.root = root, .taken = taken, .open = open, .payloads = payloads, .mkey = mkey, .mval = mval, .sbuf = "", .spos = 0};
+}
+
+YDec yd_keep(YDec d) { return yd_of(d.root, d.taken, d.open, d.payloads, d.mkey, d.mval); }
+
+// The state of an untyped map read: `key` while the key is being read,
+// `value` once the pair's value is waiting to be read.
+YDec yd_mark(YDec d, Bool key, Option(YValue) val) {
+    return yd_of(d.root, d.taken, d.open, d.payloads, key, val);
+}
+
+// With a string held for read_str_next to pull code points from.
+YDec yd_sbuf(YDec d, Str text, Int at) {
+    return YDec {.root = d.root, .taken = d.taken, .open = d.open, .payloads = d.payloads, .mkey = d.mkey, .mval = d.mval, .sbuf = text, .spos = at};
+}
+
+YDec yd_push(YDec d, YFrame f) { return yd_of(d.root, d.taken, d.open.concat([f]), d.payloads, false, None); }
+
+YDec yd_pop(YDec d) {
+    Int k = d.open.len();
+    if (k == 0) { return d; }
+    return yd_of(d.root, d.taken, d.open[0..k - 1], d.payloads, false, None);
+}
+
+// The open table's own cursor.
+YCur yd_keys(YDec d) {
+    YCur empty = YCur {.pairs = [], .pos = 0};
+    if (d.open.len() == 0) { return YCur {.pairs = yv_pairs(d.root), .pos = d.taken}; }
+    YFrame f = d.open[d.open.len() - 1];
+    YCur got = match f { YKeys(x) => x, _ => empty };
+    return got;
+}
+
+YDec yd_set_keys(YDec d, YCur c) {
+    if (d.open.len() == 0) { return yd_of(d.root, c.pos, d.open, d.payloads, false, None); }
+    Int k = d.open.len() - 1;
+    return yd_of(d.root, d.taken, d.open[0..k].concat([YKeys(c)]), d.payloads, false, None);
+}
+
+Bool yd_has_keys(YDec d) {
+    if (d.open.len() == 0) { return false; }
+    YFrame f = d.open[d.open.len() - 1];
+    return match f { YKeys(_) => true, _ => false };
+}
+
+YItems yd_items(YDec d) {
+    YItems empty = YItems {.items = [], .pos = 0};
+    if (d.open.len() == 0) { return empty; }
+    YFrame f = d.open[d.open.len() - 1];
+    YItems got = match f { YElems(x) => x, _ => empty };
+    return got;
+}
+
+YDec yd_set_items(YDec d, YItems l) {
+    Int k = d.open.len() - 1;
+    return yd_of(d.root, d.taken, d.open[0..k].concat([YElems(l)]), d.payloads, false, None);
+}
+
+// The next value the container owes a verb: the next key's value of the
+// open mapping, the next element of the open sequence, or the root.
+Result(Parsed(YValue, YDec), SerialError) yd_next(YDec d) {
+    // A pair whose key was read owes its value next, whatever is open.
+    if (Some(v) = d.mval) { return parsed(v, yd_mark(d, false, None)); }
+    if (d.open.len() == 0) {
+        if (d.taken > 0) { return Err(syntax_error("the document is already read")); }
+        return parsed(d.root, yd_mark(yd_of(d.root, 1, d.open, d.payloads, false, None), false, None));
+    }
+    YFrame f = d.open[d.open.len() - 1];
+    // An untyped map read is on the key of the pair at the cursor: the read
+    // takes it and hands the value back through read_map_value.
+    if (d.mkey && yd_is_keys(f)) { return yd_take_key(d); }
+    if (yd_is_keys(f)) { return yd_next_key(d); }
+    return yd_next_item(d);
+}
+
+// The key of the pair at the cursor, and that pair's value held back for
+// read_map_value.
+Result(Parsed(YValue, YDec), SerialError) yd_take_key(YDec d) {
+    YCur c = yd_keys(d);
+    if (c.pos >= c.pairs.len()) { return Err(syntax_error("the mapping has no more keys")); }
+    YEntryV pair = c.pairs[c.pos];
+    YCur moved = YCur {.pairs = c.pairs, .pos = c.pos + 1};
+    return parsed(YStr(pair.key), yd_mark(yd_set_keys(d, moved), false, Some(pair.value)));
+}
+
+// What an open frame holds, for a test to look at.
+pub YItems yd_items_of_frame(List(YFrame) open, Int i) {
+    YItems empty = YItems {.items = [], .pos = 0};
+    if (i >= open.len()) { return empty; }
+    YFrame f = open[i];
+    YItems got = match f { YElems(x) => x, _ => empty };
+    return got;
+}
+
+Bool yd_is_keys(YFrame f) { return match f { YKeys(_) => true, _ => false }; }
+
+Result(Parsed(YValue, YDec), SerialError) yd_next_key(YDec d) {
+    YCur c = yd_keys(d);
+    if (c.pos >= c.pairs.len()) { return Err(syntax_error("the mapping has no more keys")); }
+    return parsed(c.pairs[c.pos].value, yd_set_keys(d, YCur {.pairs = c.pairs, .pos = c.pos + 1}));
+}
+
+Result(Parsed(YValue, YDec), SerialError) yd_next_item(YDec d) {
+    YItems l = yd_items(d);
+    if (l.pos >= l.items.len()) { return Err(syntax_error("the sequence has no more items")); }
+    return parsed(l.items[l.pos], yd_set_items(d, YItems {.items = l.items, .pos = l.pos + 1}));
+}
+
+Result(Parsed(YValue, YDec), SerialError) yd_take(YDec d, Str want) {
+    Result(Parsed(YValue, YDec), SerialError) n = yd_next(d);
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) { return parsed(x.value, x.rest); }
+    return Err(custom_error("unreachable"));
+}
+
+// ─── The decoder's verbs ─────────────────────────────────────────────
+
+Result(Parsed(Int, YDec), SerialError) yd_int(YDec d) {
+    Result(Parsed(YValue, YDec), SerialError) n = yd_take(d, "an integer");
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) {
+        if (!yv_is_int(x.value)) { return Err(invalid_type("an integer", yv_kind(x.value))); }
+        return parsed(yv_int(x.value), x.rest);
+    }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(UInt(64), YDec), SerialError) yd_uint(YDec d) {
+    Parsed(Int, YDec) n = yd_int(d)?;
+    if (n.value < 0) { return Err(invalid_value(f"{n.value}", "an unsigned integer")); }
+    return parsed((UInt(64))n.value, n.rest);
+}
+
+Result(Parsed(Int(128), YDec), SerialError) yd_i128(YDec d) {
+    Parsed(Int, YDec) n = yd_int(d)?;
+    return parsed((Int(128))n.value, n.rest);
+}
+
+Result(Parsed(UInt(128), YDec), SerialError) yd_u128(YDec d) {
+    Parsed(Int, YDec) n = yd_int(d)?;
+    if (n.value < 0) { return Err(invalid_value(f"{n.value}", "an unsigned integer")); }
+    return parsed((UInt(128))n.value, n.rest);
+}
+
+Result(Parsed(Float, YDec), SerialError) yd_float(YDec d) {
+    Result(Parsed(YValue, YDec), SerialError) n = yd_take(d, "a float");
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) {
+        if (yv_is_float(x.value)) { return parsed(yv_float(x.value), x.rest); }
+        if (yv_is_int(x.value)) { return parsed((Float)yv_int(x.value), x.rest); }
+        return Err(invalid_type("a float", yv_kind(x.value)));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(Bool, YDec), SerialError) yd_bool(YDec d) {
+    Result(Parsed(YValue, YDec), SerialError) n = yd_take(d, "a bool");
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) {
+        if (!yv_is_bool(x.value)) { return Err(invalid_type("a bool", yv_kind(x.value))); }
+        return parsed(yv_bool(x.value), x.rest);
+    }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(Str, YDec), SerialError) yd_str(YDec d) {
+    Result(Parsed(YValue, YDec), SerialError) n = yd_take(d, "a string");
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) {
+        if (yv_is_str(x.value)) { return parsed(yv_str(x.value), x.rest); }
+        if (yv_is_int(x.value)) { return parsed(f"{yv_int(x.value)}", x.rest); }
+        if (yv_is_float(x.value)) { return parsed(y_float(yv_float(x.value)), x.rest); }
+        if (yv_is_bool(x.value)) { return parsed(if (yv_bool(x.value)) { "true" } else { "false" }, x.rest); }
+        return Err(invalid_type("a string", yv_kind(x.value)));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// A string read one code point at a time is taken whole and then walked, so
+// read_str_next pulls from what read_str_begin held rather than taking a
+// second value.
+Result(Parsed(Int, YDec), SerialError) yd_str_begin(YDec d) {
+    Parsed(Str, YDec) s = yd_str(d)?;
+    return parsed(str_len(s.value), yd_sbuf(s.rest, s.value, 0));
+}
+
+// The next code point, or -1 once the string is done, which also lets go
+// of the text it was holding.
+Result(Parsed(Int, YDec), SerialError) yd_str_next(YDec d) {
+    if (d.spos >= str_len(d.sbuf)) { return parsed(0 - 1, yd_sbuf(d, "", 0)); }
+    Int cp = str_char_at(d.sbuf, d.spos);
+    return parsed(cp, yd_sbuf(d, d.sbuf, d.spos + 1));
+}
+
+Result(Parsed(List(Int), YDec), SerialError) yd_bytes(YDec d) { return Err(unsupported("bytes")); }
+
+Result(Parsed(Int, YDec), SerialError) yd_bytes_begin(YDec d) { return Err(unsupported("bytes")); }
+
+Result(Parsed(Int, YDec), SerialError) yd_bytes_next(YDec d) { return Err(unsupported("bytes")); }
+
+// A unit has no spelling of its own: YAML's null is the one value that
+// carries nothing, and it is what read_option looks for too.
+Result(YDec, SerialError) yd_unit(YDec d) {
+    Result(Parsed(YValue, YDec), SerialError) n = yd_take(d, "a null");
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) {
+        if (!yv_is_null(x.value)) { return Err(invalid_type("a unit", yv_kind(x.value))); }
+        return Ok(x.rest);
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// YAML has a null, so an option is a value that may be null.
+// Whether a peek is the null.
+Bool yd_is_none_peek(Peek p) { return match p { PeekNone => true, _ => false }; }
+
+// A null is None and is taken; anything else is left where it is, since
+// the read of the value follows.
+Result(Parsed(Bool, YDec), SerialError) yd_option(YDec d) {
+    Result(Parsed(Peek, YDec), SerialError) pk = yd_peek(d);
+    if (Err(e) = pk) { return Err(e); }
+    if (Ok(p) = pk) {
+        if (yd_is_none_peek(p.value)) {
+            Result(Parsed(YValue, YDec), SerialError) n = yd_take(d, "a null");
+            if (Err(e) = n) { return Err(e); }
+            if (Ok(x) = n) { return parsed(false, x.rest); }
+        }
+        return parsed(true, d);
+    }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(Int, YDec), SerialError) yd_table_begin(YDec d) {
+    Result(Parsed(YValue, YDec), SerialError) n = yd_next(d);
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) {
+        if (!yv_is_map(x.value)) { return Err(invalid_type("a mapping", yv_kind(x.value))); }
+        List(YEntryV) pairs = yv_pairs(x.value);
+        return parsed(pairs.len(), yd_push(x.rest, YKeys(YCur {.pairs = pairs, .pos = 0})));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Parsed(Int, YDec), SerialError) yd_seq_begin(YDec d) {
+    Result(Parsed(YValue, YDec), SerialError) n = yd_next(d);
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) {
+        if (!yv_is_seq(x.value)) { return Err(invalid_type("a sequence", yv_kind(x.value))); }
+        List(YValue) items = yv_items(x.value);
+        return parsed(items.len(), yd_push(x.rest, YElems(YItems {.items = items, .pos = 0})));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// The next key of the open mapping, matched against the names the type
+// knows; the value follows.
+Result(Parsed(FieldKey, YDec), SerialError) yd_field(YDec d, List(Str) fields) {
+    if (!yd_has_keys(d)) { return Err(custom_error("no mapping is open")); }
+    YCur c = yd_keys(d);
+    if (c.pos >= c.pairs.len()) { return parsed(EndOfFields, yd_pop(d)); }
+    Str key = c.pairs[c.pos].key;
+    Int idx = name_index(fields, key);
+    FieldKey k = if (idx < 0) { UnknownField(key) } else { KnownField(idx) };
+    // The cursor stays: the value that follows is the one this pair holds,
+    // and the read of it is what steps over the name.
+    return parsed(k, d);
+}
+
+// Whether another element is there. Saying yes does not consume it: the
+// read of the element is what takes it, and that is what counts it.
+Result(Parsed(Bool, YDec), SerialError) yd_seq_next(YDec d) {
+    if (d.open.len() == 0) { return Err(custom_error("no sequence is open")); }
+    YItems l = yd_items(d);
+    if (l.pos >= l.items.len()) { return parsed(false, yd_pop(d)); }
+    return parsed(true, d);
+}
+
+
+Result(Parsed(Bool, YDec), SerialError) yd_map_next(YDec d) {
+    if (!yd_has_keys(d)) { return Err(custom_error("no mapping is open")); }
+    YCur c = yd_keys(d);
+    if (c.pos >= c.pairs.len()) { return parsed(false, yd_pop(d)); }
+    // The next read is the key; read_map_value then hands over the value.
+    return parsed(true, yd_mark(d, true, None));
+}
+
+Result(YDec, SerialError) yd_map_value(YDec d) { return Ok(d); }
+
+Result(YDec, SerialError) yd_struct_begin(YDec d, Str name, List(Str) fields) {
+    Result(Parsed(YValue, YDec), SerialError) n = yd_next(d);
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) {
+        if (!yv_is_map(x.value)) { return Err(invalid_type("a mapping", yv_kind(x.value))); }
+        List(YEntryV) pairs = yv_pairs(x.value);
+        return Ok(yd_push(x.rest, YKeys(YCur {.pairs = pairs, .pos = 0})));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// ─── Variants ────────────────────────────────────────────────────────
+
+// A variant is a mapping with a `type` key naming it and, when there is a
+// payload, a `value` key holding it.
+Result(Parsed(Str, YDec), SerialError) yd_variant_name_at(YDec d) {
+    Result(Parsed(YValue, YDec), SerialError) n = yd_next(d);
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) {
+        if (!yv_is_map(x.value)) { return Err(invalid_type("an enum variant", yv_kind(x.value))); }
+        List(YEntryV) pairs = yv_pairs(x.value);
+        Result(Str, SerialError) name = yd_type_of(pairs);
+        if (Err(e) = name) { return Err(e); }
+        if (Ok(v) = name) { return parsed(v, yd_push(x.rest, YKeys(YCur {.pairs = pairs, .pos = 0}))); }
+    }
+    return Err(custom_error("unreachable"));
+}
+
+Result(Str, SerialError) yd_type_of(List(YEntryV) pairs) {
+    if (!yd_has_pair(pairs, "type", 0)) { return Err(missing_field("type")); }
+    YValue t = yd_pair_at(pairs, "type");
+    if (!yv_is_str(t)) { return Err(invalid_type("a string", yv_kind(t))); }
+    return Ok(yv_str(t));
+}
+
+Bool yd_has_pair(List(YEntryV) pairs, Str key, Int i) {
+    if (i >= pairs.len()) { return false; }
+    if (pairs[i].key == key) { return true; }
+    return yd_has_pair(pairs, key, i + 1);
+}
+
+YValue yd_pair_at(List(YEntryV) pairs, Str key) {
+    YValue got = if (pairs.len() == 0) { YStr("") } else { pairs[0].value };
+    return yd_pair_from(pairs, key, 0, got);
+}
+
+YValue yd_pair_from(List(YEntryV) pairs, Str key, Int i, YValue fallback) {
+    if (i >= pairs.len()) { return fallback; }
+    if (pairs[i].key == key) { return pairs[i].value; }
+    return yd_pair_from(pairs, key, i + 1, fallback);
+}
+
+Result(Parsed(Int, YDec), SerialError) yd_variant(YDec d, Str enum_name, List(Str) variants) {
+    Result(Parsed(Str, YDec), SerialError) n = yd_variant_name_at(d);
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) {
+        Int idx = name_index(variants, x.value);
+        if (idx < 0) { return Err(unknown_variant(x.value, variants)); }
+        return parsed(idx, yd_skip_type(x.rest));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// The name has been read; the payload, if any, is the next value.
+YDec yd_skip_type(YDec d) {
+    YCur c = yd_keys(d);
+    return yd_set_keys(d, YCur {.pairs = c.pairs, .pos = c.pos + 1});
+}
+
+Result(Parsed(VariantName, YDec), SerialError) yd_variant_name(YDec d) {
+    Result(Parsed(Str, YDec), SerialError) n = yd_variant_name_at(d);
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) {
+        return parsed(VariantName {.enum_name = "", .index = 0 - 1, .name = x.value, .has_payload = yd_has_value(x.rest)}, yd_skip_type(x.rest));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+Bool yd_has_value(YDec d) {
+    YCur c = yd_keys(d);
+    return yd_has_pair(c.pairs, "value", 0);
+}
+
+// The payload is the value of the `value` key, which is the next one after
+// the tag was read.
+Result(YDec, SerialError) yd_variant_payload(YDec d) {
+    if (!yd_has_keys(d)) { return Err(custom_error("no variant is open")); }
+    YCur c = yd_keys(d);
+    return Ok(yd_set_keys(d, YCur {.pairs = c.pairs, .pos = yd_value_at(c.pairs, 0, c.pos)}));
+}
+
+// Where the `value` key is, or the one after the tag when there is none.
+Int yd_value_at(List(YEntryV) pairs, Int i, Int fallback) {
+    if (i >= pairs.len()) { return fallback; }
+    if (pairs[i].key == "value") { return i; }
+    return yd_value_at(pairs, i + 1, fallback);
+}
+
+// A unit variant has no payload, and nothing else will close its mapping.
+Result(YDec, SerialError) yd_variant_unit(YDec d) { return Ok(yd_pop(d)); }
+
+Result(YDec, SerialError) yd_variant_end(YDec d) { return Ok(yd_pop(d)); }
+
+// ─── Untyped reads ───────────────────────────────────────────────────
+
+pub Str yv_kind(YValue v) {
+    Str got = match v {
+        YNull => "null",
+        YBool(_) => "a bool",
+        YInt(_) => "an integer",
+        YFloat(_) => "a float",
+        YStr(_) => "a string",
+        YSeqV(_) => "a sequence",
+        YMapV(_) => "a mapping"
+    };
+    return got;
+}
+
+Result(Parsed(Peek, YDec), SerialError) yd_peek(YDec d) {
+    // A document may be a bare scalar, so the root is what it is, not a
+    // mapping on account of being the root.
+    if (d.open.len() == 0 && d.taken == 0) { return parsed(yv_peek_of(d.root), d); }
+    // A pair waiting on its value peeks at that, not at the next pair.
+    if (Some(v) = d.mval) { return parsed(yv_peek_of(v), d); }
+    if (yd_has_keys(d)) {
+        YCur c = yd_keys(d);
+        if (c.pos >= c.pairs.len()) { return Err(syntax_error("no value left")); }
+        if (d.mkey) { return parsed(yv_peek_of(YStr(c.pairs[c.pos].key)), d); }
+        return parsed(yv_peek_of(c.pairs[c.pos].value), d);
+    }
+    YItems l = yd_items(d);
+    if (l.pos >= l.items.len()) { return Err(syntax_error("no value left")); }
+    return parsed(yv_peek_of(l.items[l.pos]), d);
+}
+
+Peek yv_peek_of(YValue v) {
+    Peek got = match v {
+        YNull => PeekNone,
+        YBool(_) => PeekBool,
+        YInt(_) => PeekInt,
+        YFloat(_) => PeekFloat,
+        YStr(_) => PeekStr,
+        YSeqV(_) => PeekSeq,
+        YMapV(_) => PeekMap
+    };
+    return got;
+}
+
+Result(YDec, SerialError) yd_skip(YDec d) {
+    Result(Parsed(YValue, YDec), SerialError) n = yd_next(d);
+    if (Err(e) = n) { return Err(e); }
+    if (Ok(x) = n) { return Ok(x.rest); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(YDec, SerialError) yd_end(YDec d) {
+    if (d.open.len() > 0) { return Err(syntax_error("a container is still open")); }
+    return Ok(d);
+}
+
+Bool yd_human(YDec d) { return true; }
+
+Decoder(YDec) = {
+    .read_bool = yd_bool, .read_int = yd_int, .read_uint = yd_uint, .read_i128 = yd_i128, .read_u128 = yd_u128,
+    .read_float = yd_float, .read_str = yd_str,
+    .read_bytes = yd_bytes, .read_unit = yd_unit, .read_option = yd_option,
+    .read_str_begin = yd_str_begin, .read_str_next = yd_str_next,
+    .read_bytes_begin = yd_bytes_begin, .read_bytes_next = yd_bytes_next,
+    .read_seq_begin = yd_seq_begin, .read_seq_next = yd_seq_next,
+    .read_map_begin = yd_table_begin, .read_map_next = yd_map_next, .read_map_value = yd_map_value,
+    .read_struct_begin = yd_struct_begin, .read_field = yd_field,
+    .read_variant = yd_variant, .read_variant_name = yd_variant_name, .read_variant_unit = yd_variant_unit,
+    .read_variant_payload = yd_variant_payload, .read_variant_end = yd_variant_end,
+    .read_skip = yd_skip, .read_peek = yd_peek, .read_end = yd_end, .decodes_human_readable = yd_human
+};
+
+// ─── Entry points ────────────────────────────────────────────────────
+
+@needs(Encode(T, YEnc))
+pub Result(Str, SerialError) to_yaml(T x) {
+    YEnc e = encode(x, y_start(yaml_encoder()))?;
+    return Ok(yaml_text(e));
+}
+
+@needs(Decode(T, YDec))
+pub Result(T, SerialError) from_yaml(Str in) {
+    Result(YValue, SerialError) v = yaml_value(in);
+    if (Err(e) = v) { return Err(e); }
+    if (Ok(root) = v) {
+        Result(Parsed(T, YDec), SerialError) r = decode(yaml_decoder(root));
+        if (Err(e) = r) { return Err(e); }
+        if (Ok(x) = r) { return Ok(x.value); }
+    }
+    return Err(custom_error("unreachable"));
+}

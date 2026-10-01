@@ -1,0 +1,44 @@
+import "../src/yaml.resid";
+
+// check.resid — the assertions the tests use. Each prints one line, so a
+// golden file of all-ok lines pins the whole suite.
+
+pub Bool check(Str name, Bool ok) {
+    println(if (ok) { "ok   " + name } else { "FAIL " + name });
+    return ok;
+}
+
+pub Bool check_text(Str name, Str got, Str want) {
+    if (got == want) {
+        println("ok   " + name);
+        return true;
+    }
+    println("FAIL " + name + "\n       want " + want + "\n       got  " + got);
+    return false;
+}
+
+// What a failure says, or "ok".
+pub Str err_of(Result(X, SerialError) r) {
+    if (Err(e) = r) { return error_text(e); }
+    return "ok";
+}
+
+// What a 128-bit decode gave, or the error.
+pub Str big_text(Result(Int(128), SerialError) r) {
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+pub Str ubig_text(Result(UInt(128), SerialError) r) {
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+// The hex an encode produced, for the Str-returning entry point.
+pub Str hex_text_of(Result(Str, SerialError) r) {
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(s) = r) { return s; }
+    return "unreachable";
+}

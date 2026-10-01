@@ -1,0 +1,20 @@
+ok   config/text
+ok   config/back
+ok   config/alias
+ok   config/minimal
+ok   config/deny unknown
+ok   config/skipped
+ok   event/started
+ok   event/stopped
+ok   event/back
+ok   event/unit back
+ok   event/unknown kind
+ok   meters
+ok   loose/num text
+ok   loose/num back
+ok   loose/word text
+ok   loose/word back
+ok   loose/float is not a num
+ok   loose/null is nothing
+ok   loose/sequence is nothing
+exit 0

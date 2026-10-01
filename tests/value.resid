@@ -1,0 +1,106 @@
+// value.resid — the format-neutral Value tree over YAML. Decoding a Value
+// asks the format what comes next (read_peek) and skips what it does not
+// know (read_skip), so this is where the self-describing side of the
+// decoder is exercised.
+//
+// A YAML document may be a bare scalar, so a Value does not need a wrapper
+// the way it does in a mapping-only format.
+
+import "../src/yaml.resid";
+import "../../resid-serial/src/value.resid";
+import "check.resid";
+
+// Decode, show, and write it back out again: the same text means the two
+// directions agree.
+Str trip(Str text) {
+    Result(Value, SerialError) r = from_yaml(text);
+    if (Err(e) = r) { return "decode: " + error_text(e); }
+    if (Ok(v) = r) { return show_value(v); }
+    return "unreachable";
+}
+
+Str again(Str text) {
+    Result(Value, SerialError) r = from_yaml(text);
+    if (Err(e) = r) { return "decode: " + error_text(e); }
+    if (Ok(v) = r) { return hex_text_of(to_yaml(v)); }
+    return "unreachable";
+}
+
+// A Value built in code, encoded, decoded and encoded again: the same text
+// both ways.
+Bool wire(Str name, Value want) {
+    Result(Str, SerialError) text = to_yaml(want);
+    if (Err(e) = text) { return check_text(name, "encode: " + error_text(e), "ok"); }
+    return wire_again(name, text, want);
+}
+
+Bool wire_again(Str name, Result(Str, SerialError) text, Value want) {
+    if (Ok(wrote) = text) {
+        Result(Value, SerialError) r = from_yaml(wrote);
+        if (Err(e) = r) { return check_text(name, "decode: " + error_text(e), wrote); }
+        if (Ok(got) = r) { return check_text(name, hex_text_of(to_yaml(got)), wrote); }
+    }
+    return check_text(name, "unreachable", show_value(want));
+}
+
+Int main() {
+    // What each kind reads as. A document may be a bare scalar, so these
+    // are the document's own shape rather than a wrapper's.
+    check_text("peek/bool", trip("true\n"), "true");
+    check_text("peek/negative", trip("-1\n"), "-1");
+    check_text("peek/big int", trip("9223372036854775807\n"), "9223372036854775807");
+    check_text("peek/hex", trip("0x1F\n"), "31");
+    check_text("peek/float", trip("1.5\n"), "1.5");
+    check_text("peek/inf", trip(".inf\n"), "inf");
+    check_text("peek/null tilde", trip("~\n"), "None");
+    check_text("peek/null word", trip("null\n"), "None");
+    check_text("peek/string", trip("abc\n"), "\"abc\"");
+    check_text("peek/quoted string", trip("'123'\n"), "\"123\"");
+    check_text("peek/date", trip("2024-01-01\n"), "\"2024-01-01\"");
+    check_text("peek/sequence", trip("- 1\n- 2\n- 3\n"), "[1, 2, 3]");
+    check_text("peek/flow sequence", trip("[1, 2, 3]\n"), "[1, 2, 3]");
+    check_text("peek/array of tables", trip("- n: 1\n- n: 2\n"), "[{\"n\": 1}, {\"n\": 2}]");
+    check_text("peek/mapping", trip("a: 1\nb: x\n"), "{\"a\": 1, \"b\": \"x\"}");
+    check_text("peek/flow mapping", trip("{a: 1, b: x}\n"), "{\"a\": 1, \"b\": \"x\"}");
+    check_text("peek/nested", trip("a:\n  - 1\n  - b: 2\n"), "{\"a\": [1, {\"b\": 2}]}");
+    check_text("peek/tagged string", trip("!!str 7\n"), "\"7\"");
+    check_text("peek/empty mapping", trip("{}\n"), "{}");
+    check_text("peek/empty sequence", trip("[]\n"), "[]");
+
+    // Written back out, the same text.
+    check_text("again/scalars", again("a: 1\nb: x\nc: true\nd: 1.5\n"), "---\na: 1\nb: x\nc: true\nd: 1.5\n");
+    check_text("again/sequence", again("- 1\n- 2\n"), "---\n- 1\n- 2\n");
+    check_text("again/nested", again("a:\n  b:\n    c: 1\n"), "---\na:\n  b:\n    c: 1\n");
+    check_text("again/array of tables", again("- n: 1\n- n: 2\n"), "---\n- n: 1\n- n: 2\n");
+    check_text("again/quoted", again("a: '123'\n"), "---\na: '123'\n");
+    check_text("again/scalar document", again("abc\n"), "---\nabc\n");
+
+    // Values built here, through the encoder and back.
+    wire("value/bool", VBool(false));
+    wire("value/int", VInt(0 - 7));
+    wire("value/uint fits", VUInt(4294967295));
+    check_text("value/uint", hex_text_of(to_yaml(VUInt(18446744073709551615))),
+        "invalid value 18446744073709551615, expected a YAML integer, which is 64 bits");
+    wire("value/i128 fits", VI128(i128(0) - i128(4294967296)));
+    wire("value/u128 fits", VU128(u128(4294967295)));
+    check_text("value/u128", hex_text_of(to_yaml(VU128(u128(18446744073709551615)))),
+        "invalid value 18446744073709551615, expected a YAML integer, which is 64 bits");
+    wire("value/float", VFloat(0.1));
+    wire("value/str", VStr("héllo"));
+    wire("value/number as text", VStr("123"));
+    wire("value/quotes in a string", VStr("a: b"));
+    wire("value/newline in a string", VStr("a\nb"));
+    wire("value/none", VNone);
+    wire("value/seq", VSeq([VInt(1), VStr("x"), VBool(true)]));
+    wire("value/empty seq", VSeq([]));
+    wire("value/seq of maps", VSeq([vstruct("Pt", [vfield("x", VInt(1))])]));
+    wire("value/map", VMap([ventry(VStr("k"), VSeq([]))]));
+    wire("value/struct", vstruct("Pt", [vfield("x", VInt(1)), vfield("y", VInt(2))]));
+    wire("value/unit variant", VUnitVariant(vtag("Shape", 0, "Dot")));
+    wire("value/variant", VVariant(VPayload {.tag = vtag("Shape", 0, "Circle"), .payload = VInt(3)}));
+    wire("value/nested", VSeq([VSome(VMap([ventry(VStr("k"), VUnitVariant(vtag("E", 0, "None")))]))]));
+    check_text("value/bytes", hex_text_of(to_yaml(VBytes([0, 1, 255]))), "bytes is not supported by this format");
+    check_text("value/unit", hex_text_of(to_yaml(VUnit)), "a unit value, which reads back as None is not supported by this format");
+
+    return 0;
+}

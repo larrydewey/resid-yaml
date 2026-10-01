@@ -1,0 +1,50 @@
+ok   peek/bool
+ok   peek/negative
+ok   peek/big int
+ok   peek/hex
+ok   peek/float
+ok   peek/inf
+ok   peek/null tilde
+ok   peek/null word
+ok   peek/string
+ok   peek/quoted string
+ok   peek/date
+ok   peek/sequence
+ok   peek/flow sequence
+ok   peek/array of tables
+ok   peek/mapping
+ok   peek/flow mapping
+ok   peek/nested
+ok   peek/tagged string
+ok   peek/empty mapping
+ok   peek/empty sequence
+ok   again/scalars
+ok   again/sequence
+ok   again/nested
+ok   again/array of tables
+ok   again/quoted
+ok   again/scalar document
+ok   value/bool
+ok   value/int
+ok   value/uint fits
+ok   value/uint
+ok   value/i128 fits
+ok   value/u128 fits
+ok   value/u128
+ok   value/float
+ok   value/str
+ok   value/number as text
+ok   value/quotes in a string
+ok   value/newline in a string
+ok   value/none
+ok   value/seq
+ok   value/empty seq
+ok   value/seq of maps
+ok   value/map
+ok   value/struct
+ok   value/unit variant
+ok   value/variant
+ok   value/nested
+ok   value/bytes
+ok   value/unit
+exit 0

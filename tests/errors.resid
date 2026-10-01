@@ -1,0 +1,313 @@
+// errors.resid — what the format reports when the document is wrong.
+// Every case is an error value with a kind and a path, never an abort.
+
+import "../src/yaml.resid";
+import "check.resid";
+
+// ─── The model ───────────────────────────────────────────────────────
+
+type Point = { Int x; Int y; };
+
+type Shape = Circle(Int) | Dot;
+
+type Nested = { Point p; };
+
+type Holder = { Shape k; };
+
+type Scalars = { Str s; Int n; Float f; Bool b; List(Int) xs; };
+
+List(Str) point_fields() { return ["x", "y"]; }
+
+List(Str) shape_variants() { return ["Circle", "Dot"]; }
+
+List(Str) scalars_fields() { return ["s", "n", "f", "b", "xs"]; }
+
+// ─── The instances ───────────────────────────────────────────────────
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point(F s) {
+    F s1 = read_struct_begin(s, "Point", point_fields())?;
+    return dec_point_fields(s1, None, None);
+}
+Decode(Point, F) = dec_point;
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point_fields(F s, Option(Int) x, Option(Int) y) {
+    Parsed(FieldKey, F) k = read_field(s, point_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_point_slot(k.rest, i, x, y),
+        UnknownField(f) => dec_point_fields(skip_unknown(k.rest, f, point_fields(), false)?, x, y),
+        EndOfFields => finish_point(k.rest, x, y)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point_slot(F s, Int i, Option(Int) x, Option(Int) y) {
+    if (i == 0) {
+        Parsed(Option(Int), F) v = read_slot(s, x, "x")?;
+        return dec_point_fields(v.rest, v.value, y);
+    }
+    Parsed(Option(Int), F) v = read_slot(s, y, "y")?;
+    return dec_point_fields(v.rest, x, v.value);
+}
+
+Result(Parsed(Point, F), SerialError) finish_point(F s, Option(Int) x, Option(Int) y) {
+    Int xv = require(x, "x")?;
+    Int yv = require(y, "y")?;
+    return parsed(Point {.x = xv, .y = yv}, s);
+}
+
+@needs(Decoder(F))
+Result(Parsed(Shape, F), SerialError) dec_shape(F s) {
+    Parsed(Int, F) v = read_variant(s, "Shape", shape_variants())?;
+    if (v.value == 0) {
+        Parsed(Int, F) r = read_newtype_payload(v.rest, "Circle")?;
+        return parsed(Circle(r.value), r.rest);
+    }
+    return read_unit_payload(v.rest, Dot);
+}
+Decode(Shape, F) = dec_shape;
+
+@needs(Decoder(F))
+Result(Parsed(Nested, F), SerialError) dec_nested(F s) {
+    F s1 = read_struct_begin(s, "Nested", ["p"])?;
+    return dec_nested_fields(s1, None);
+}
+Decode(Nested, F) = dec_nested;
+
+@needs(Decoder(F))
+Result(Parsed(Nested, F), SerialError) dec_nested_fields(F s, Option(Point) p) {
+    Parsed(FieldKey, F) k = read_field(s, ["p"])?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_nested_slot(k.rest, i, p),
+        UnknownField(f) => dec_nested_fields(skip_unknown(k.rest, f, ["p"], false)?, p),
+        EndOfFields => parsed(Nested {.p = require(p, "p")?}, k.rest)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Nested, F), SerialError) dec_nested_slot(F s, Int i, Option(Point) p) {
+    Parsed(Option(Point), F) v = read_slot(s, p, "p")?;
+    return dec_nested_fields(v.rest, v.value);
+}
+
+@needs(Decoder(F))
+Result(Parsed(Holder, F), SerialError) dec_holder(F s) {
+    F s1 = read_struct_begin(s, "Holder", ["k"])?;
+    return dec_holder_fields(s1, None);
+}
+Decode(Holder, F) = dec_holder;
+
+@needs(Decoder(F))
+Result(Parsed(Holder, F), SerialError) dec_holder_fields(F s, Option(Shape) k) {
+    Parsed(FieldKey, F) j = read_field(s, ["k"])?;
+    FieldKey key = j.value;
+    return match key {
+        KnownField(i) => dec_holder_slot(j.rest, i, k),
+        UnknownField(f) => dec_holder_fields(skip_unknown(j.rest, f, ["k"], false)?, k),
+        EndOfFields => parsed(Holder {.k = require(k, "k")?}, j.rest)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Holder, F), SerialError) dec_holder_slot(F s, Int i, Option(Shape) k) {
+    Parsed(Option(Shape), F) v = read_slot(s, k, "k")?;
+    return dec_holder_fields(v.rest, v.value);
+}
+
+@needs(Decoder(F))
+Result(Parsed(Scalars, F), SerialError) dec_scalars(F s) {
+    F s1 = read_struct_begin(s, "Scalars", scalars_fields())?;
+    return dec_scalars_fields(s1, None, None, None, None, None);
+}
+Decode(Scalars, F) = dec_scalars;
+
+@needs(Decoder(F))
+Result(Parsed(Scalars, F), SerialError) dec_scalars_fields(F s, Option(Str) a, Option(Int) b, Option(Float) c, Option(Bool) d, Option(List(Int)) e) {
+    Parsed(FieldKey, F) k = read_field(s, scalars_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_scalars_slot(k.rest, i, a, b, c, d, e),
+        UnknownField(f) => dec_scalars_fields(skip_unknown(k.rest, f, scalars_fields(), false)?, a, b, c, d, e),
+        EndOfFields => parsed(Scalars {.s = require(a, "s")?, .n = require(b, "n")?, .f = require(c, "f")?, .b = require(d, "b")?, .xs = require(e, "xs")?}, k.rest)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Scalars, F), SerialError) dec_scalars_slot(F s, Int i, Option(Str) a, Option(Int) b, Option(Float) c, Option(Bool) d, Option(List(Int)) e) {
+    if (i == 0) {
+        Parsed(Option(Str), F) v = read_slot(s, a, "s")?;
+        return dec_scalars_fields(v.rest, v.value, b, c, d, e);
+    }
+    if (i == 1) {
+        Parsed(Option(Int), F) v = read_slot(s, b, "n")?;
+        return dec_scalars_fields(v.rest, a, v.value, c, d, e);
+    }
+    if (i == 2) {
+        Parsed(Option(Float), F) v = read_slot(s, c, "f")?;
+        return dec_scalars_fields(v.rest, a, b, v.value, d, e);
+    }
+    if (i == 3) {
+        Parsed(Option(Bool), F) v = read_slot(s, d, "b")?;
+        return dec_scalars_fields(v.rest, a, b, c, v.value, e);
+    }
+    Parsed(Option(List(Int)), F) v = read_slot(s, e, "xs")?;
+    return dec_scalars_fields(v.rest, a, b, c, d, v.value);
+}
+
+// ─── The tripwires ───────────────────────────────────────────────────
+
+Str err_text_of(Str doc) {
+    Result(Point, SerialError) r = from_yaml(doc);
+    if (Err(e) = r) { return error_text(e); }
+    return "ok";
+}
+
+Str point_of(Str doc) {
+    Result(Point, SerialError) r = from_yaml(doc);
+    if (Err(e) = r) { return "error: " + error_text(e); }
+    if (Ok(p) = r) { return f"{p.x},{p.y}"; }
+    return "unreachable";
+}
+
+Str nested_err(Str doc) {
+    Result(Nested, SerialError) r = from_yaml(doc);
+    if (Err(e) = r) { return error_text(e); }
+    return "ok";
+}
+
+Str holder_err(Str doc) {
+    Result(Holder, SerialError) r = from_yaml(doc);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return shape_text(v.k); }
+    return "unreachable";
+}
+
+Str shape_text(Shape v) {
+    Shape got = v;
+    return match got { Circle(n) => f"Circle({n})", Dot => "Dot" };
+}
+
+Str shape_err(Str doc) {
+    Result(Shape, SerialError) r = from_yaml(doc);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return shape_text(v); }
+    return "unreachable";
+}
+
+Str scalars_err(Str doc) {
+    Result(Scalars, SerialError) r = from_yaml(doc);
+    if (Err(e) = r) { return error_text(e); }
+    return "ok";
+}
+
+// What the parser made of a document, as text, so a grammar case can be
+// checked without a type.
+Str tree(Str doc) {
+    Result(YValue, SerialError) r = yaml_value(doc);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return yv_kind(v); }
+    return "unreachable";
+}
+
+Int main() {
+    // ─── What the grammar refuses ─────────────────────────────────────
+    // A line that is not a `key: value` is a plain scalar, which is a
+    // document of its own.
+    check_text("grammar/bare scalar", tree("a 1\n"), "a string");
+    check_text("grammar/empty value", tree("a:\n  b\n"), "a mapping");
+    check_text("grammar/empty key", tree(": 1\n"), "a mapping key with nothing in it on line 1");
+    check_text("grammar/tab indent", err_text_of("\tx: 1\ny: 2\n"), "a tab may not be used as indentation on line 1");
+
+    // A value that is not closed, and a key that is not closed.
+    check_text("grammar/unclosed quote", tree("a: 'abc\n"), "a quoted scalar that is never closed");
+    check_text("grammar/unclosed flow", tree("a: [1, 2\n"), "a flow sequence that never closes");
+    check_text("grammar/unclosed flow map", tree("a: {b: 1\n"), "a flow mapping that never closes");
+    check_text("grammar/unclosed anchor", tree("a: &\n"), "an anchor needs a name on line 0");
+
+    // An indentation the document does not agree with itself about.
+    check_text("indent/too deep", tree("a: 1\n  b: 2\n"), "a mapping key is indented too far on line 2");
+    // A `-` with nothing on it, and the sequence under it, is a nested one.
+    check_text("indent/entry under entry", tree("-\n  - 1\n  - 2\n"), "a sequence");
+
+    // The same key twice, and a tag that is not one.
+    check_text("duplicate/key", tree("a: 1\na: 2\n"), "the key `a` is set twice on line 2");
+    check_text("duplicate/nested", tree("a:\n  b: 1\n  b: 2\n"), "the key `b` is set twice on line 3");
+    check_text("tag/unknown", tree("a: !!widget x\n"), "unknown tag `tag:yaml.org,2002:widget`");
+    check_text("tag/seq on a scalar", tree("a: !!seq 1\n"), "`tag:yaml.org,2002:seq` is a tag for a sequence, not a scalar");
+    check_text("tag/int on a word", tree("a: !!int word\n"), "invalid type: expected an integer, found \"word\"");
+    check_text("tag/float on a word", tree("a: !!float word\n"), "invalid type: expected a float, found \"word\"");
+    check_text("tag/binary", tree("a: !!binary aGk=\n"), "a binary tag, which this format has no bytes for");
+
+    // A `%TAG` handle says what the document's own tags stand for, and one
+    // that was never declared means nothing here.
+    check_text("tag/handle", tree("%TAG !e! tag:example.com,2000:app/\n---\na: !e!thing x\n"), "a mapping");
+    check_text("tag/handle on a key", tree("%TAG !e! tag:example.com,2000:app/\n---\n!e!thing a: 1\n"), "a mapping");
+    check_text("tag/handle undeclared", tree("a: !e!thing x\n"), "the tag handle `!e!` has no %TAG directive");
+    check_text("tag/directive without a handle", tree("%TAG tag:example.com,2000:app/\n---\na: 1\n"),
+        "a %TAG directive needs a handle like `!e!` on line 1");
+    check_text("tag/directive without a prefix", tree("%TAG !e!\n---\na: 1\n"),
+        "a %TAG directive needs a prefix for its handle on line 1");
+
+    // An integer is unbounded in YAML and 64 bits here, so one that does
+    // not fit is an error rather than a number that wrapped around.
+    check_text("int/one too many", tree("9223372036854775808\n"),
+        "invalid value 9223372036854775808, expected a YAML integer, which is 64 bits");
+    check_text("int/negative one too many", tree("-9223372036854775809\n"),
+        "invalid value -9223372036854775809, expected a YAML integer, which is 64 bits");
+    check_text("int/hex too many", tree("0xFFFFFFFFFFFFFFFF\n"),
+        "invalid value 0xFFFFFFFFFFFFFFFF, expected a YAML integer, which is 64 bits");
+    check_text("int/tagged too many", tree("a: !!int 9223372036854775808\n"),
+        "invalid value 9223372036854775808, expected a YAML integer, which is 64 bits");
+    check_text("int/largest", tree("9223372036854775807\n"), "an integer");
+    check_text("int/smallest", tree("-9223372036854775808\n"), "an integer");
+
+    // An alias with no anchor, and one that would follow itself.
+    check_text("alias/none", tree("a: *missing\n"), "the alias `*missing` has no anchor");
+    check_text("alias/self", tree("a: &a\n  b: *a\n"), "the anchor `&a` refers to itself");
+
+    // ─── What the types find missing ──────────────────────────────────
+    check_text("field/missing", err_text_of("x: 1\n"), "missing field `y`");
+    check_text("field/both", point_of("x: 1\ny: 2\n"), "1,2");
+    check_text("field/text where an int belongs", err_text_of("x: a\ny: 2\n"), "invalid type: expected an integer, found a string at .x");
+    check_text("field/sequence where an int belongs", err_text_of("x: [1]\ny: 2\n"), "invalid type: expected an integer, found a sequence at .x");
+    check_text("field/mapping where an int belongs", err_text_of("x: {b: 1}\ny: 2\n"), "invalid type: expected an integer, found a mapping at .x");
+    check_text("field/scalar where a table belongs", nested_err("p: 1\n"), "invalid type: expected a mapping, found an integer at .p");
+    check_text("field/sequence where a table belongs", nested_err("p: [1]\n"), "invalid type: expected a mapping, found a sequence at .p");
+
+    // ─── What a variant needs ─────────────────────────────────────────
+    check_text("variant/no type", shape_err("value: 3\n"), "missing field `type`");
+    check_text("variant/unknown", shape_err("type: Square\n"), "unknown variant `Square`, expected `Circle` or `Dot`");
+    check_text("variant/type not text", shape_err("type: 1\n"), "invalid type: expected a string, found an integer");
+    check_text("variant/not a table", holder_err("k: 1\n"), "invalid type: expected an enum variant, found an integer at .k");
+    check_text("variant/payload", shape_err("type: Circle\nvalue: 3\n"), "Circle(3)");
+    check_text("variant/unit", shape_err("type: Dot\n"), "Dot");
+
+    // ─── A field's own type ───────────────────────────────────────────
+    check_text("scalars/all", scalars_err("s: a\nn: 1\nf: 1.5\nb: true\nxs: [1, 2]\n"), "ok");
+    // A number where a string belongs reads as its own text, which is how a
+    // string that looks like a number survives the round trip.
+    check_text("scalars/number as text", scalars_err("s: 1\nn: 1\nf: 1.5\nb: true\nxs: []\n"), "ok");
+    check_text("scalars/wrong int", scalars_err("s: a\nn: 1.5\nf: 1.5\nb: true\nxs: []\n"), "invalid type: expected an integer, found a float at .n");
+    check_text("scalars/wrong list", scalars_err("s: a\nn: 1\nf: 1.5\nb: true\nxs: 1\n"), "invalid type: expected a sequence, found an integer at .xs");
+    check_text("scalars/wrong item", scalars_err("s: a\nn: 1\nf: 1.5\nb: true\nxs: [1, b]\n"), "invalid type: expected an integer, found a string at .xs[1]");
+    check_text("scalars/null where a string belongs", scalars_err("s: null\nn: 1\nf: 1.5\nb: true\nxs: []\n"), "invalid type: expected a string, found null at .s");
+
+    // A document that is a scalar, read as the string it looks like: the
+    // variant reader wants a mapping, which is what the grammar says a
+    // variant is, so a bare scalar is not one.
+    check_text("bare/string", shape_err("---\nhello\n"), "invalid type: expected an enum variant, found a string");
+    check_text("bare/number", shape_err("---\n7\n"), "invalid type: expected an enum variant, found an integer");
+    check_text("bare/sequence", shape_err("---\n- 1\n"), "invalid type: expected an enum variant, found a sequence");
+    check_text("bare/null", shape_err("---\n~\n"), "invalid type: expected an enum variant, found null");
+
+    // ─── Reading past the end ─────────────────────────────────────────
+    // An empty document is the null scalar, which is not a mapping.
+    check_text("end/empty document", err_text_of(""), "invalid type: expected a mapping, found null");
+    check_text("end/only a comment", err_text_of("# nothing here\n"), "invalid type: expected a mapping, found null");
+    check_text("end/a second document", shape_err("type: Dot\n---\ntype: Circle\nvalue: 1\n"), "Dot");
+
+    return 0;
+}

@@ -1,0 +1,37 @@
+ok   fixed/text
+ok   fixed/back
+ok   fixed/empty
+ok   fixed/too long
+ok   struct
+ok   struct/text
+ok   struct/negative
+ok   struct/markers
+ok   enum/Circle
+ok   enum/Dot
+ok   enum/Circle text
+ok   enum/Dot text
+ok   nested
+ok   nested/text
+ok   config/none
+ok   config/some
+ok   config/text
+ok   config/none text
+ok   string/root
+ok   string/empty
+ok   string/ascii
+ok   string/utf8
+ok   string/emoji
+ok   string/looks like a number
+ok   string/looks like a bool
+ok   string/looks like null
+ok   string/colon
+ok   string/quote
+ok   string/newline
+ok   string/tab
+ok   string/text
+ok   option/list
+ok   option/list text
+ok   bytes
+ok   u128 past 64
+ok   unit
+exit 0

@@ -1,0 +1,405 @@
+// yaml_resolve.resid — the resolver: what a scalar means, given its tag.
+import "../../resid-serial/src/serial.resid";
+//
+// YAML leaves that open. A plain scalar is a string unless it looks like
+// something else, and a tag says what it is whatever it looks like. This is
+// the core schema of YAML 1.2, plus the parts of the JSON schema that are
+// written out the same way, and the tags a document may use for itself.
+//
+// The result is a tree of resolved values, which is what the format's
+// Encoder and Decoder walk.
+
+import "yaml_parse.resid";
+
+// A resolved value.
+type YValue = YNull | YBool(Bool) | YInt(Int) | YFloat(Float) | YStr(Str) | YSeqV(List(YValue)) | YMapV(List(YEntryV));
+
+type YEntryV = { Str key; YValue value; };
+
+pub Bool yv_is_null(YValue v) { return match v { YNull => true, _ => false }; }
+
+pub Bool yv_is_bool(YValue v) { return match v { YBool(_) => true, _ => false }; }
+
+pub Bool yv_is_int(YValue v) { return match v { YInt(_) => true, _ => false }; }
+
+pub Bool yv_is_float(YValue v) { return match v { YFloat(_) => true, _ => false }; }
+
+pub Bool yv_is_str(YValue v) { return match v { YStr(_) => true, _ => false }; }
+
+pub Bool yv_is_seq(YValue v) { return match v { YSeqV(_) => true, _ => false }; }
+
+pub Bool yv_is_map(YValue v) { return match v { YMapV(_) => true, _ => false }; }
+
+pub Bool yv_bool(YValue v) {
+    Bool got = match v { YBool(x) => x, _ => false };
+    return got;
+}
+
+pub Int yv_int(YValue v) {
+    Int got = match v { YInt(x) => x, _ => 0 };
+    return got;
+}
+
+pub Float yv_float(YValue v) {
+    Float got = match v { YFloat(x) => x, _ => 0.0 };
+    return got;
+}
+
+pub Str yv_str(YValue v) {
+    Str got = match v { YStr(x) => x, _ => "" };
+    return got;
+}
+
+pub List(YValue) yv_items(YValue v) {
+    List(YValue) got = match v { YSeqV(x) => x, _ => [] };
+    return got;
+}
+
+pub List(YEntryV) yv_pairs(YValue v) {
+    List(YEntryV) got = match v { YMapV(x) => x, _ => [] };
+    return got;
+}
+
+// ─── The resolver ────────────────────────────────────────────────────
+
+// The tree a parsed node resolves to. A tag says what a scalar is, whatever
+// it looks like; without one, a plain scalar is a string unless it looks
+// like a null, a bool, an int or a float.
+pub Result(YValue, SerialError) y_resolve(YNode n) {
+    if (y_is_seq(n)) { return y_resolve_seq(n, 0, []); }
+    if (y_is_map(n)) { return y_resolve_map(n, 0, []); }
+    return y_resolve_scalar(n);
+}
+
+Result(YValue, SerialError) y_resolve_seq(YNode n, Int i, List(YValue) acc) {
+    if (i >= y_items(n).len()) { return Ok(YSeqV(acc)); }
+    Result(YValue, SerialError) one = y_resolve(y_items(n)[i]);
+    if (Err(e) = one) { return Err(e); }
+    if (Ok(v) = one) { return y_resolve_seq(n, i + 1, acc.concat([v])); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(YValue, SerialError) y_resolve_map(YNode n, Int i, List(YEntryV) acc) {
+    if (i >= y_pairs(n).len()) { return Ok(YMapV(acc)); }
+    YPair p = y_pairs(n)[i];
+    if (y_key_taken(acc, p.key, 0)) { return Err(syntax_error("the key `" + p.key + "` is set twice")); }
+    Result(YValue, SerialError) v = y_resolve(p.value);
+    if (Err(e) = v) { return Err(e); }
+    if (Ok(value) = v) {
+        YEntryV entry = YEntryV {.key = p.key, .value = value};
+        return y_resolve_map(n, i + 1, acc.concat([entry]));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+Bool y_key_taken(List(YEntryV) entries, Str key, Int i) {
+    if (i >= entries.len()) { return false; }
+    if (entries[i].key == key) { return true; }
+    return y_key_taken(entries, key, i + 1);
+}
+
+// A scalar, with its tag deciding what it is.
+Result(YValue, SerialError) y_resolve_scalar(YNode n) {
+    YScalar s = y_scalar(n);
+    Str tag = s.tag;
+    Bool implicit = s.implicit;
+    if (implicit) { return y_implicit(s); }
+    return y_tagged(s, tag);
+}
+
+// Only a plain scalar is resolved by what it looks like; a quoted or block
+// one is a string whatever it says.
+pub Bool y_plain_style(YStyle s) { return match s { YPlain => true, _ => false }; }
+
+// A scalar with no tag: a quoted one is always a string, and a plain one is
+// whatever it looks like.
+Result(YValue, SerialError) y_implicit(YScalar s) {
+    if (!y_plain_style(s.style)) { return Ok(YStr(s.text)); }
+    Str text = s.text;
+    if (str_len(text) == 0 || text == "~" || text == "null" || text == "Null" || text == "NULL") { return Ok(YNull); }
+    if (text == "true" || text == "True" || text == "TRUE") { return Ok(YBool(true)); }
+    if (text == "false" || text == "False" || text == "FALSE") { return Ok(YBool(false)); }
+    // An integer the 64 bits of an Int cannot hold is an error rather than
+    // a number that wrapped around: YAML's integers are unbounded, this
+    // one is not.
+    if (y_looks_int(text)) { return y_int_magnitude(text, y_int_base(text, 0, 0)); }
+    if (y_looks_float(text)) { return Ok(YFloat(y_float_value(text))); }
+    return Ok(YStr(text));
+}
+
+// What the core schema's tags say.
+Result(YValue, SerialError) y_tagged(YScalar s, Str tag) {
+    Str text = s.text;
+    if (tag == "!!str" || tag == "!" || tag == "tag:yaml.org,2002:str") { return Ok(YStr(text)); }
+    if (tag == "!!null" || tag == "tag:yaml.org,2002:null") { return Ok(YNull); }
+    if (tag == "!!bool" || tag == "tag:yaml.org,2002:bool") { return Ok(y_bool_tag(text)); }
+    if (tag == "!!int" || tag == "tag:yaml.org,2002:int") { return y_int_tag(text); }
+    if (tag == "!!float" || tag == "tag:yaml.org,2002:float") { return y_float_tag(text); }
+    if (tag == "!!seq" || tag == "tag:yaml.org,2002:seq") { return Err(syntax_error("`" + tag + "` is a tag for a sequence, not a scalar")); }
+    if (tag == "!!map" || tag == "tag:yaml.org,2002:map") { return Err(syntax_error("`" + tag + "` is a tag for a mapping, not a scalar")); }
+    if (tag == "!!binary" || tag == "tag:yaml.org,2002:binary") { return Err(syntax_error("a binary tag, which this format has no bytes for")); }
+    if (tag == "!!timestamp" || tag == "tag:yaml.org,2002:timestamp") { return Ok(YStr(text)); }
+    // A tag of the document's own, whether written `!name` or through a
+    // `%TAG` handle, has nothing here to resolve to, so its text is kept.
+    if (y_local_tag(tag) || y_own_tag(tag)) { return Ok(YStr(text)); }
+    return Err(custom_error("unknown tag `" + tag + "`"));
+}
+
+// A local tag, `!name` or `!handle!name`, is the document's own: there is
+// nothing to resolve it to, so its text is kept.
+// A tag outside the standard namespace: the document named it, so it is
+// the document's own. A `tag:yaml.org,2002:` one is not: those have a
+// meaning of their own, and an unknown one is an error rather than text.
+Bool y_own_tag(Str tag) {
+    Str ns = "tag:yaml.org,2002:";
+    return !y_word_is_str(tag, ns, 0);
+}
+
+Bool y_word_is_str(Str s, Str word, Int i) {
+    Int n = str_len(word);
+    if (i + n > str_len(s)) { return false; }
+    return str_slice(s, i, i + n) == word;
+}
+
+Bool y_local_tag(Str tag) {
+    if (str_len(tag) < 2) { return false; }
+    if (str_char_at(tag, 0) != 33) { return false; }
+    return y_has_word(tag, 1);
+}
+
+Bool y_has_word(Str tag, Int i) { return y_word_from(tag, i, false); }
+
+Bool y_word_from(Str tag, Int i, Bool seen) {
+    if (i >= str_len(tag)) { return seen; }
+    Int c = str_char_at(tag, i);
+    if (y_is_alpha(c) || y_is_digit(c) || c == 45 || c == 95 || c == 46 || c == 47) { return y_word_from(tag, i + 1, true); }
+    return false;
+}
+
+YValue y_bool_tag(Str text) {
+    if (text == "true" || text == "True" || text == "TRUE" || text == "yes" || text == "Yes" || text == "on") { return YBool(true); }
+    if (text == "false" || text == "False" || text == "FALSE" || text == "no" || text == "No" || text == "off") { return YBool(false); }
+    return YStr(text);
+}
+
+// ─── Integers ────────────────────────────────────────────────────────
+
+// An integer is decimal, octal, hexadecimal or binary, with a sign and
+// underscores between the digits.
+pub Bool y_looks_int(Str text) { return y_int_scan(text, y_int_base(text, 0, 0), 0, false); }
+
+// The base an integer is written in: the `0x`, `0o` or `0b` prefix, or ten.
+Int y_int_base(Str text, Int i, Int seen) {
+    if (i >= str_len(text)) { return 10; }
+    Int c = str_char_at(text, i);
+    if (c == 43 || c == 45) { return y_int_base(text, i + 1, seen); }
+    if (c == 48 && i + 1 < str_len(text)) {
+        Int k = str_char_at(text, i + 1);
+        if (k == 120 || k == 88) { return 16; }
+        if (k == 111 || k == 79) { return 8; }
+        if (k == 98 || k == 66) { return 2; }
+    }
+    return 10;
+}
+
+Bool y_int_scan(Str text, Int base, Int seen, Bool ok) {
+    return y_int_scan_at(text, y_int_start(text, base, 0), seen, ok, base);
+}
+
+// Past the sign and the `0x`, `0o` or `0b` prefix, which say the base.
+Int y_int_start(Str text, Int base, Int i) {
+    if (i < str_len(text) && (str_char_at(text, i) == 43 || str_char_at(text, i) == 45)) { return y_int_start(text, base, i + 1); }
+    if (base == 10) { return i; }
+    if (i + 1 < str_len(text) && str_char_at(text, i) == 48) { return i + 2; }
+    return i;
+}
+
+// Whether the digits from i on are all of them in their base. Whether the
+// number is one is a question about its digits, so nothing is accumulated
+// here: a number too big for an Int is caught when its value is taken.
+Bool y_int_scan_at(Str text, Int i, Int seen, Bool ok, Int base) {
+    if (i >= str_len(text)) { return ok && seen > 0; }
+    Int c = str_char_at(text, i);
+    if (c == 95) { return y_int_scan_at(text, i + 1, seen, ok, base); }
+    if ((c == 43 || c == 45) && i == 0) { return y_int_scan_at(text, i + 1, seen, ok, base); }
+    Int d = y_digit_in(c, base);
+    if (d < 0) { return false; }
+    return y_int_scan_at(text, i + 1, seen + 1, true, base);
+}
+
+Int y_digit_in(Int c, Int base) {
+    Int d = y_hex_value(c);
+    if (c < 48 || c > 102) { return 0 - 1; }
+    if (d < 0 || d >= base) { return 0 - 1; }
+    return d;
+}
+
+// An integer's value, with the sign and the base: the magnitude is taken
+// with the bound checked before each multiply, so a number the 64 bits of
+// an Int cannot hold is an error rather than one that wrapped around. YAML
+// writes integers of any size; this tree holds them in an Int.
+Result(YValue, SerialError) y_int_magnitude(Str text, Int base) {
+    Bool down = str_char_at(text, 0) == 45;
+    Int max = 9223372036854775807;
+    // The magnitude is taken as an unsigned number, where the bound is a
+    // plain limit to compare against, and the sign is put back at the end:
+    // one more than the largest positive value is the smallest negative one.
+    UInt(64) bound = if (down) { (UInt(64))max + 1 } else { (UInt(64))max };
+    Result(UInt(64), SerialError) m = y_digits_at(text, base, y_digits_start(text, base, 0), (UInt(64))0, bound);
+    if (Err(e) = m) { return Err(e); }
+    if (Ok(v) = m) {
+        Int n = if (down) { if (v > (UInt(64))max) { 0 - max - 1 } else { 0 - (Int)v } } else { (Int)v };
+        return Ok(YInt(n));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// Where the digits start: past the sign, the underscores, and a `0x`
+// prefix, which is how a base is written.
+Int y_digits_start(Str text, Int base, Int i) {
+    if (i >= str_len(text)) { return i; }
+    Int c = str_char_at(text, i);
+    if (c == 43 || c == 45 || c == 95) { return y_digits_start(text, base, i + 1); }
+    if (c == 48 && base != 10 && i + 1 < str_len(text)) {
+        Int k = str_char_at(text, i + 1);
+        if (k == 120 || k == 88 || k == 111 || k == 79 || k == 98 || k == 66) { return i + 2; }
+    }
+    return i;
+}
+
+// The digits taken in their base, each one checked against the bound before
+// the multiply rather than after it.
+Result(UInt(64), SerialError) y_digits_at(Str text, Int base, Int i, UInt(64) acc, UInt(64) bound) {
+    if (i >= str_len(text)) { return Ok(acc); }
+    Int c = str_char_at(text, i);
+    if (c == 95) { return y_digits_at(text, base, i + 1, acc, bound); }
+    Int d = y_digit_in(c, base);
+    if (d < 0) { return Ok(acc); }
+    UInt(64) step = (UInt(64))d;
+    UInt(64) radix = (UInt(64))base;
+    if (acc > (bound - step) / radix) { return Err(invalid_value(text, "a YAML integer, which is 64 bits")); }
+    return y_digits_at(text, base, i + 1, acc * radix + step, bound);
+}
+
+// An integer's digits without its `0x` prefix, which is what the scan
+// checks.
+// An integer written with a tag, which has to be one.
+Result(YValue, SerialError) y_int_tag(Str text) {
+    if (!y_looks_int(text)) { return Err(invalid_type("an integer", "\"" + text + "\"")); }
+    return y_int_magnitude(text, 10);
+}
+
+// ─── Floats ──────────────────────────────────────────────────────────
+
+// A float is an integer with a point or an exponent, or one of the three
+// the specification gives names to.
+Bool y_looks_float(Str text) {
+    Str low = str_to_lower(text);
+    if (low == ".inf" || low == "-.inf" || low == "+.inf" || low == ".nan") { return true; }
+    if (y_looks_int(text)) { return false; }
+    return y_float_scan(low, 0, 0, false);
+}
+
+Bool y_float_scan(Str s, Int i, Int seen, Bool ok) {
+    return y_float_scan_at(s, i, seen, ok, false, false);
+}
+
+Bool y_float_scan_at(Str s, Int i, Int seen, Bool ok, Bool point, Bool expo) {
+    if (i >= str_len(s)) { return ok && (point || expo); }
+    Int c = str_char_at(s, i);
+    if (c == 95) { return y_float_scan_at(s, i + 1, seen, ok, point, expo); }
+    if (!point && !expo && (c == 43 || c == 45) && seen == 0) { return y_float_scan_at(s, i + 1, seen, ok, point, expo); }
+    if (c == 46 && !point && !expo) { return y_float_scan_at(s, i + 1, seen, ok, true, expo); }
+    if ((c == 101 || c == 69) && seen > 0) {
+        Int j = y_exp_sign(s, i + 1);
+        return y_float_scan_at(s, j, seen, ok, point, true);
+    }
+    if (!y_is_digit(c)) { return false; }
+    return y_float_scan_at(s, i + 1, seen + 1, true, point, expo);
+}
+
+Int y_exp_sign(Str s, Int i) {
+    if (i < str_len(s) && (str_char_at(s, i) == 43 || str_char_at(s, i) == 45)) { return i + 1; }
+    return i;
+}
+
+// A float's value: the whole part, the fraction, and the exponent scaled in
+// at the end.
+// A float's value, with the three the specification names handled first.
+pub Float y_float_value(Str text) {
+    Str low = str_to_lower(text);
+    if (low == ".inf" || low == "+.inf") { return y_pos_inf(); }
+    if (low == "-.inf") { return y_neg_inf(); }
+    if (low == ".nan") { return y_nan(); }
+    return y_float_of(text, 10, 0.0);
+}
+
+// A float's value, from its text.
+pub Float y_float_of(Str text, Int base, Float acc) {
+    Str s = str_to_lower(text);
+    Int e = y_exp_at(s, 0, 0);
+    Str mantissa = str_slice(s, 0, e);
+    Int exp = y_exp_digits(s, e + 1, 0, 1);
+    Float m = y_mantissa(mantissa, 0, 0.0, 0.0, false);
+    return y_scale_float(m, exp, 0, 1.0);
+}
+
+// Where the exponent's `e` is, if there is one.
+Int y_exp_at(Str s, Int i, Int seen) {
+    if (i >= str_len(s)) { return str_len(s); }
+    Int c = str_char_at(s, i);
+    if (c == 101 && seen > 0) { return i; }
+    if (c == 95 || y_is_digit(c) || c == 46 || c == 43 || c == 45) { return y_exp_at(s, i + 1, seen + 1); }
+    return str_len(s);
+}
+
+// The exponent's digits, with the sign they may carry.
+Int y_exp_digits(Str s, Int i, Int acc, Int seen) {
+    if (i >= str_len(s)) { return acc; }
+    Int c = str_char_at(s, i);
+    if (c == 45) { return 0 - y_exp_digits(s, i + 1, 0, seen); }
+    if (c == 43) { return y_exp_digits(s, i + 1, acc, seen); }
+    if (!y_is_digit(c)) { return acc; }
+    return y_exp_digits(s, i + 1, acc * 10 + y_hex_value(c), seen + 1);
+}
+
+// The digits before and after the point, as one number, with the sign at
+// the end.
+Float y_mantissa(Str s, Int i, Float whole, Float scale, Bool point) {
+    if (i >= str_len(s)) { return y_signed(s, whole); }
+    Int c = str_char_at(s, i);
+    if (c == 95) { return y_mantissa(s, i + 1, whole, scale, point); }
+    if (c == 46 && !point) { return y_mantissa(s, i + 1, whole, 0.1, true); }
+    if (c == 43 || c == 45) { return y_mantissa(s, i + 1, whole, scale, point); }
+    if (!y_is_digit(c)) { return y_signed(s, whole); }
+    if (point) { return y_mantissa(s, i + 1, whole + (y_hex_value(c) * scale), scale * 0.1, true); }
+    return y_mantissa(s, i + 1, (whole * 10.0) + (y_hex_value(c) * 1.0), scale, false);
+}
+
+Float y_signed(Str s, Float v) {
+    if (str_len(s) > 0 && str_char_at(s, 0) == 45) { return 0.0 - v; }
+    return v;
+}
+
+// Ten to the power of `n`, which is the exponent's job. A power this large
+// is a float at its limit, and a power this small is zero, so both stop
+// there.
+Float y_scale_float(Float m, Int n, Int i, Float acc) {
+    if (i >= 400) { return m; }
+    if (n == 0) { return m * acc; }
+    if (n > 0) { return y_scale_float(m, n - 1, i + 1, acc * 10.0); }
+    return y_scale_float(m, n + 1, i + 1, acc * 0.1);
+}
+
+Result(YValue, SerialError) y_float_tag(Str text) {
+    // An integer with a float tag is a float: that is what the tag says it
+    // is, and `2` and `2.0` are the same number.
+    if (!y_looks_float(text) && !y_looks_int(text)) { return Err(invalid_type("a float", "\"" + text + "\"")); }
+    return Ok(YFloat(y_float_value(text)));
+}
+
+Float y_pos_inf() { Float z = 0.0; return 1.0 / z; }
+
+Float y_neg_inf() { Float z = 0.0; return 0.0 - (1.0 / z); }
+
+Float y_nan() { Float z = 0.0; return z / z; }

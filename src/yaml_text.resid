@@ -1,0 +1,237 @@
+import "../../resid-serial/src/serial.resid";
+
+// yaml_text.resid — how a YAML scalar is written, and when a plain one is
+// safe. A plain scalar is the readable form, so it is used wherever it
+// cannot be mistaken for something else; otherwise the value is quoted, and
+// a string with newlines in it is written as a literal block.
+
+// ─── Code points ─────────────────────────────────────────────────────
+
+// Whether the character at `i` is `c`, counting a position past the end as
+// no character at all.
+pub Bool y_at(Str in, Int i, Int c) {
+    if (i < 0 || i >= str_len(in)) { return false; }
+    return str_char_at(in, i) == c;
+}
+
+pub Bool y_is_space(Int c) { return c == 32 || c == 9; }
+
+pub Bool y_is_nl(Int c) { return c == 10; }
+
+pub Bool y_is_digit(Int c) { return c >= 48 && c <= 57; }
+
+pub Bool y_is_hex(Int c) { return y_is_digit(c) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70); }
+
+pub Int y_hex_value(Int c) {
+    if (c >= 48 && c <= 57) { return c - 48; }
+    if (c >= 97 && c <= 102) { return c - 87; }
+    return c - 55;
+}
+
+pub Bool y_is_alpha(Int c) { return (c >= 65 && c <= 90) || (c >= 97 && c <= 122); }
+
+// ─── Plain scalars ───────────────────────────────────────────────────
+
+// A plain scalar cannot start with an indicator, since the first character
+// decides what the scalar is: a mapping key, a sequence entry, a tag, an
+// anchor, a document marker or a flow collection.
+pub Bool y_plain_first_ok(Int c) {
+    if (y_is_space(c) || y_is_nl(c)) { return false; }
+    if (c == 45 || c == 63 || c == 58 || c == 44 || c == 91 || c == 93 || c == 123 || c == 125) { return false; }
+    if (c == 35 || c == 38 || c == 33 || c == 124 || c == 62 || c == 39 || c == 34 || c == 37 || c == 64 || c == 96) { return false; }
+    return true;
+}
+
+// Nothing inside a plain scalar may be `: ` or ` #`, which would end it, and
+// a flow collection also ends at one of its own indicators.
+pub Bool y_plain_body_ok(Str text, Bool flow) {
+    Int i = 0;
+    return y_plain_body_at(text, flow, i, 0);
+}
+
+Bool y_plain_body_at(Str text, Bool flow, Int i, Int at) {
+    if (at >= str_len(text)) { return true; }
+    Int c = str_char_at(text, at);
+    if (c == 58 && y_follows_space_or_end(text, at)) { return false; }
+    if (c == 35 && at > 0 && y_is_space(str_char_at(text, at - 1))) { return false; }
+    if (c == 10 || c == 13) { return false; }
+    if (flow && (c == 44 || c == 91 || c == 93 || c == 123 || c == 125)) { return false; }
+    return y_plain_body_at(text, flow, i, at + 1);
+}
+
+Bool y_follows_space_or_end(Str text, Int at) {
+    if (at + 1 >= str_len(text)) { return true; }
+    return y_is_space(str_char_at(text, at + 1));
+}
+
+// A plain scalar is empty only where an empty one is allowed, and a value
+// that reads as null, a bool or a number needs quoting to stay a string.
+pub Bool y_needs_quote(Str text) {
+    if (str_len(text) == 0) { return true; }
+    if (!y_plain_first_ok(str_char_at(text, 0))) { return true; }
+    if (!y_plain_body_ok(text, false)) { return true; }
+    if (y_plain_last_is_space(text)) { return true; }
+    return false;
+}
+
+Bool y_plain_last_is_space(Str text) {
+    if (str_len(text) == 0) { return false; }
+    return y_is_space(str_char_at(text, str_len(text) - 1));
+}
+
+// A value that a plain scalar would resolve to something else: a bool, a
+// null, a number, or a timestamp.
+pub Bool y_reads_as_other(Str text) {
+    Str low = str_to_lower(text);
+    if (low == "true" || low == "false" || low == "null" || low == "~") { return true; }
+    if (low == "yes" || low == "no" || low == "on" || low == "off") { return true; }
+    if (y_looks_numeric(low)) { return true; }
+    if (y_looks_like_date(low)) { return true; }
+    return false;
+}
+
+Bool y_looks_numeric(Str low) {
+    Int i = y_sign_end(low, 0);
+    if (i >= str_len(low)) { return false; }
+    if (str_char_at(low, i) == 46) { return i + 1 < str_len(low) && y_is_digit(str_char_at(low, i + 1)); }
+    if (!y_is_digit(str_char_at(low, i))) { return false; }
+    Int j = y_digits_to(low, i);
+    // Digits and nothing else: that is an integer, and it reads as one.
+    if (j == str_len(low)) { return true; }
+    if (j < str_len(low) && str_char_at(low, j) == 46) { return y_digits_to(low, j + 1) > j + 1; }
+    if (j < str_len(low) && (str_char_at(low, j) == 101 || str_char_at(low, j) == 69)) { return true; }
+    if (j < str_len(low) && str_char_at(low, j) == 120) { return true; }
+    if (j < str_len(low) && str_char_at(low, j) == 111) { return true; }
+    if (j < str_len(low) && (str_char_at(low, j) == 105 || str_char_at(low, j) == 73)) { return true; }
+    if (j < str_len(low) && str_char_at(low, j) == 78) { return true; }
+    return j < str_len(low) && (str_char_at(low, j) == 47 || str_char_at(low, j) == 58);
+}
+
+// Past a leading sign, if there is one.
+Int y_sign_end(Str low, Int i) {
+    if (i < str_len(low) && (str_char_at(low, i) == 45 || str_char_at(low, i) == 43)) { return i + 1; }
+    return i;
+}
+
+// Where a run of digits ends.
+Int y_digits_to(Str low, Int at) {
+    if (at >= str_len(low) || !y_is_digit(str_char_at(low, at))) { return at; }
+    return y_digits_to(low, at + 1);
+}
+
+Bool y_looks_like_date(Str low) {
+    if (str_len(low) < 8) { return false; }
+    return y_is_digit(str_char_at(low, 0)) && y_is_digit(str_char_at(low, 1)) && y_is_digit(str_char_at(low, 2))
+        && y_is_digit(str_char_at(low, 3)) && str_char_at(low, 4) == 45;
+}
+
+// ─── Writing a scalar ────────────────────────────────────────────────
+
+// A string as a scalar: plain where that reads back as this string, a
+// single-quoted one where it only needs the quote doubled, and a double-
+// quoted one where an escape is needed.
+pub Str y_str(Str s) {
+    if (!y_needs_quote(s) && !y_reads_as_other(s)) { return s; }
+    // A string with a line break in it is written double-quoted, where the
+    // break is an escape: a quoted scalar that runs over lines is legal but
+    // hard to read.
+    if (!y_single_ok(s)) { return "\"" + y_double(s, 0, StrBuf()) + "\""; }
+    if (y_has_break(s, 0)) { return "\"" + y_double(s, 0, StrBuf()) + "\""; }
+    return "'" + y_single(s, 0, StrBuf()) + "'";
+}
+
+pub Bool y_has_break(Str s, Int i) {
+    if (i >= str_len(s)) { return false; }
+    Int c = str_char_at(s, i);
+    if (c == 10 || c == 13) { return true; }
+    return y_has_break(s, i + 1);
+}
+
+// A key as a scalar, which is plain more often since a mapping key is not
+// resolved the same way round.
+pub Str y_key(Str s) {
+    if (!y_needs_quote(s)) { return s; }
+    if (y_single_ok(s)) { return "'" + y_single(s, 0, StrBuf()) + "'"; }
+    return "\"" + y_double(s, 0, StrBuf()) + "\"";
+}
+
+// A single-quoted scalar only needs its own quote doubled; a control
+// character other than a newline cannot be written at all.
+pub Bool y_single_ok(Str s) {
+    Int i = 0;
+    return y_single_ok_at(s, i);
+}
+
+Bool y_single_ok_at(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    Int c = str_char_at(s, i);
+    if (c == 10 || c == 13) { return true; }
+    if (c < 32 || c == 127) { return false; }
+    return y_single_ok_at(s, i + 1);
+}
+
+// A single-quoted scalar written back out, which only has to double the
+// quotes it holds. The text is gathered in one builder.
+Str y_single(Str s, Int i, StrBuf b) {
+    if (i >= str_len(s)) { return b.finish(); }
+    Int c = str_char_at(s, i);
+    if (c == 39) { return y_single(s, i + 1, b.push("''")); }
+    return y_single(s, i + 1, b.push_char(c));
+}
+
+// A double-quoted scalar spells out what a plain one cannot: a newline, a
+// tab, a quote, a backslash, a control character, and anything that would
+// resolve as something else.
+// A double-quoted scalar written back out, spelling out what a plain one
+// cannot: a newline, a tab, a quote, a backslash, a control character, and
+// anything that would resolve as something else.
+Str y_double(Str s, Int i, StrBuf b) {
+    if (i >= str_len(s)) { return b.finish(); }
+    Int c = str_char_at(s, i);
+    if (c == 34) { return y_double(s, i + 1, b.push("\\\"")); }
+    if (c == 92) { return y_double(s, i + 1, b.push("\\\\")); }
+    if (c == 10) { return y_double(s, i + 1, b.push("\\n")); }
+    if (c == 13) { return y_double(s, i + 1, b.push("\\r")); }
+    if (c == 9) { return y_double(s, i + 1, b.push("\\t")); }
+    if (c == 8) { return y_double(s, i + 1, b.push("\\b")); }
+    if (c == 12) { return y_double(s, i + 1, b.push("\\f")); }
+    if (c == 7) { return y_double(s, i + 1, b.push("\\a")); }
+    if (c == 11) { return y_double(s, i + 1, b.push("\\v")); }
+    if (c == 0) { return y_double(s, i + 1, b.push("\\0")); }
+    if (c < 32 || c == 127) { return y_double(s, i + 1, b.push(y_escape_cp(c))); }
+    return y_double(s, i + 1, b.push_char(c));
+}
+
+Str y_escape_cp(Int c) { return "\\x" + y_hex_pad(c, 0); }
+
+// Four hex digits, most significant first.
+Str y_hex_pad(Int c, Int width) {
+    if (width >= 4) { return ""; }
+    return y_hex_pad(c, width + 1) + y_hex_digit(c % 16);
+}
+
+Str y_hex_digit(Int d) {
+    if (d < 10) { return str_from_code(48 + d); }
+    return str_from_code(87 + d);
+}
+
+// A float as a scalar, which has to keep a point or an exponent so it does
+// not read back as an integer, and inf and nan as themselves.
+pub Str y_float(Float v) {
+    if (y_is_nan(v)) { return ".nan"; }
+    if (y_is_inf(v)) { return if (v < 0.0) { "-.inf" } else { ".inf" }; }
+    Str text = f"{v}";
+    if (y_has_point(text, 0)) { return text; }
+    return text + ".0";
+}
+
+Bool y_has_point(Str text, Int i) {
+    if (i >= str_len(text)) { return false; }
+    Int c = str_char_at(text, i);
+    if (c == 46 || c == 101 || c == 69) { return true; }
+    return y_has_point(text, i + 1);
+}
+
+pub Bool y_is_nan(Float v) { return v != v; }
+
+pub Bool y_is_inf(Float v) { return !y_is_nan(v) && v != 0.0 && v / 2.0 == v; }

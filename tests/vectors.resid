@@ -1,0 +1,368 @@
+// vectors.resid — the documents the YAML specification writes out, parsed
+// and read back, and the text the encoder writes for them.
+
+import "../src/yaml.resid";
+import "check.resid";
+
+// ─── Reading a value out of a document ───────────────────────────────
+
+// The value a path names, read out of the resolved document: `a.b` for a
+// key, `a[0]` for an index.
+Str look(Str doc, Str path) {
+    Result(YValue, SerialError) r = yaml_value(doc);
+    if (Err(e) = r) { return "parse: " + error_text(e); }
+    if (Ok(v) = r) { return look_at(v, path, 0); }
+    return "?";
+}
+
+Str keys_of(Str doc) {
+    Result(YValue, SerialError) r = yaml_value(doc);
+    if (Err(e) = r) { return "parse: " + error_text(e); }
+    if (Ok(v) = r) { return key_list(yv_pairs(v), 0, ""); }
+    return "?";
+}
+
+Str key_list(List(YEntryV) pairs, Int i, Str acc) {
+    if (i >= pairs.len()) { return acc; }
+    return key_list(pairs, i + 1, acc + "[" + pairs[i].key + "]");
+}
+
+Str look_at(YValue v, Str path, Int from) {
+    if (from >= str_len(path)) { return "?"; }
+    if (str_char_at(path, from) == 91) { return look_index(v, path, from); }
+    Int stop = seg_stop(path, from);
+    Str key = str_slice(path, from, stop);
+    if (key == "") { return look_index(v, path, stop); }
+    if (!yv_is_map(v)) { return "not a mapping: " + yv_kind(v); }
+    Int at = y_entry_index(v, key, 0, 0 - 1);
+    if (at < 0) { return "no key " + key; }
+    if (stop >= str_len(path)) { return value_text(entry_at(v, at)); }
+    if (str_char_at(path, stop) == 91) { return look_index(entry_at(v, at), path, stop); }
+    return look_at(entry_at(v, at), path, stop + 1);
+}
+
+// Where a key ends: at a `.` that steps into a mapping, or at a `[` that
+// indexes the value the key held.
+Int seg_stop(Str path, Int from) {
+    Int dot = y_index_of(path, ".", from);
+    Int open = y_index_of(path, "[", from);
+    if (dot < 0) { return y_clamp(open, str_len(path)); }
+    return y_clamp(open, y_clamp(dot, str_len(path)));
+}
+
+Int y_clamp(Int at, Int stop) { if (at >= 0 && at < stop) { return at; } return stop; }
+
+// The first place the character is, from `from` on, or -1.
+Int y_index_of(Str s, Str what, Int from) {
+    return y_index_from(s, str_char_at(what, 0), from, 0 - 1);
+}
+
+Int y_index_from(Str s, Int c, Int i, Int found) {
+    if (i >= str_len(s)) { return found; }
+    if (str_char_at(s, i) == c) { return i; }
+    return y_index_from(s, c, i + 1, found);
+}
+
+Int y_entry_index(YValue v, Str key, Int i, Int found) {
+    List(YEntryV) pairs = yv_pairs(v);
+    if (i >= pairs.len()) { return found; }
+    if (pairs[i].key == key) { return i; }
+    return y_entry_index(v, key, i + 1, found);
+}
+
+YValue entry_at(YValue v, Int i) {
+    List(YEntryV) pairs = yv_pairs(v);
+    if (i >= pairs.len()) { return YNull; }
+    return pairs[i].value;
+}
+
+// An index into a sequence, then the rest of the path inside it.
+Str look_index(YValue v, Str path, Int from) {
+    Int close = y_index_of(path, "]", from);
+    if (close < 0) { return "no ]"; }
+    Int idx = y_digits_of(str_slice(path, from + 1, close), 0, 0);
+    List(YValue) items = yv_items(v);
+    if (idx >= items.len()) { return "no item " + f"{idx}"; }
+    if (close + 1 >= str_len(path)) { return value_text(items[idx]); }
+    return look_at(items[idx], path, y_path_after(path, close + 1));
+}
+
+// The next segment starts after a `.` when the path has one.
+Int y_path_after(Str path, Int at) {
+    if (at < str_len(path) && str_char_at(path, at) == 46) { return at + 1; }
+    return at;
+}
+
+Int y_digits_of(Str s, Int i, Int acc) {
+    if (i >= str_len(s)) { return acc; }
+    Int c = str_char_at(s, i);
+    if (c < 48 || c > 57) { return acc; }
+    return y_digits_of(s, i + 1, acc * 10 + (c - 48));
+}
+
+// A value as the text it would be written as.
+Str value_text(YValue v) {
+    if (yv_is_null(v)) { return "null"; }
+    if (yv_is_bool(v)) { return if (yv_bool(v)) { "true" } else { "false" }; }
+    if (yv_is_int(v)) { return f"{yv_int(v)}"; }
+    if (yv_is_float(v)) { return y_float(yv_float(v)); }
+    if (yv_is_str(v)) { return "\"" + yv_str(v) + "\""; }
+    if (yv_is_seq(v)) { return array_text(yv_items(v), 0); }
+    if (yv_is_map(v)) { return table_text(yv_pairs(v), 0); }
+    return "?";
+}
+
+Str array_text(List(YValue) items, Int i) {
+    if (i >= items.len()) { return "[]"; }
+    return "[" + array_items(items, 0) + "]";
+}
+
+Str array_items(List(YValue) items, Int i) {
+    if (i >= items.len()) { return ""; }
+    Str one = value_text(items[i]);
+    if (i + 1 >= items.len()) { return one; }
+    return one + ", " + array_items(items, i + 1);
+}
+
+Str table_text(List(YEntryV) pairs, Int i) {
+    if (i >= pairs.len()) { return "{}"; }
+    return "{ " + table_pairs(pairs, 0) + " }";
+}
+
+Str table_pairs(List(YEntryV) pairs, Int i) {
+    if (i >= pairs.len()) { return ""; }
+    Str one = y_key(pairs[i].key) + ": " + value_text(pairs[i].value);
+    if (i + 1 >= pairs.len()) { return one; }
+    return one + ", " + table_pairs(pairs, i + 1);
+}
+
+// ─── The model for the encoding side ────────────────────────────────
+
+type Point = { Int x; Int y; };
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_point(Point v, F s) {
+    F s1 = write_struct_begin(s, "Point", 2)?;
+    F s2 = write_named(s1, "x", v.x)?;
+    F s3 = write_named(s2, "y", v.y)?;
+    return write_struct_end(s3);
+}
+Encode(Point, F) = enc_point;
+
+type Inner = { Str name; Int n; };
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_inner(Inner v, F s) {
+    F s1 = write_struct_begin(s, "Inner", 2)?;
+    F s2 = write_named(s1, "name", v.name)?;
+    F s3 = write_named(s2, "n", v.n)?;
+    return write_struct_end(s3);
+}
+Encode(Inner, F) = enc_inner;
+
+type Outer = { Str title; List(Inner) items; List(Int) nums; };
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_outer(Outer v, F s) {
+    F s1 = write_struct_begin(s, "Outer", 3)?;
+    F s2 = write_named(s1, "title", v.title)?;
+    F s3 = write_named(s2, "items", v.items)?;
+    F s4 = write_named(s3, "nums", v.nums)?;
+    return write_struct_end(s4);
+}
+Encode(Outer, F) = enc_outer;
+
+type Kinds = { Str s; Int n; Float f; Bool b; };
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_kinds(Kinds v, F s) {
+    F s1 = write_struct_begin(s, "Kinds", 4)?;
+    F s2 = write_named(s1, "s", v.s)?;
+    F s3 = write_named(s2, "n", v.n)?;
+    F s4 = write_named(s3, "f", v.f)?;
+    F s5 = write_named(s4, "b", v.b)?;
+    return write_struct_end(s5);
+}
+Encode(Kinds, F) = enc_kinds;
+
+type Quoted = { Str a; Str b; Str c; Str d; };
+
+@needs(Encoder(F))
+Result(F, SerialError) enc_quoted(Quoted v, F s) {
+    F s1 = write_struct_begin(s, "Quoted", 4)?;
+    F s2 = write_named(s1, "a", v.a)?;
+    F s3 = write_named(s2, "b", v.b)?;
+    F s4 = write_named(s3, "c", v.c)?;
+    F s5 = write_named(s4, "d", v.d)?;
+    return write_struct_end(s5);
+}
+Encode(Quoted, F) = enc_quoted;
+
+Str doc(Result(Str, SerialError) r) {
+    if (Err(e) = r) { return "encode: " + error_text(e); }
+    if (Ok(s) = r) { return s; }
+    return "unreachable";
+}
+
+// The document's own value, for a document that is one.
+Str root_text(Str text) {
+    Result(YValue, SerialError) r = yaml_value(text);
+    if (Err(e) = r) { return "parse: " + error_text(e); }
+    if (Ok(v) = r) { return value_text(v); }
+    return "?";
+}
+
+Str docs_count(Str text) {
+    Result(List(YValue), SerialError) r = yaml_stream(text);
+    if (Err(e) = r) { return "error: " + error_text(e); }
+    if (Ok(vs) = r) { return f"{vs.len()} documents"; }
+    return "?";
+}
+
+Int main() {
+    // ─── Block mappings ───────────────────────────────────────────────
+    check_text("map/two keys", look("a: 1\nb: two\n", "b"), "\"two\"");
+    check_text("map/nested", look("a:\n  b:\n    c: 1\n", "a.b.c"), "1");
+    check_text("map/indented one", look("a:\n    b: 1\n", "a.b"), "1");
+    check_text("map/quoted key", look("\"a b\": 1\n", "a b"), "1");
+    check_text("map/literal key", look("'a b': 1\n", "a b"), "1");
+    check_text("map/key with colon", look("\"a:b\": 1\n", "a:b"), "1");
+    check_text("map/explicit key", look("? a\n: 1\n", "a"), "1");
+    check_text("map/comment after", look("a: 1 # one\n", "a"), "1");
+    check_text("map/comment line", look("# a comment\na: 1\n", "a"), "1");
+    check_text("map/blank lines", look("a: 1\n\n\nb: 2\n", "b"), "2");
+    check_text("map/empty value", look("a:\nb: 1\n", "a"), "null");
+
+    // ─── Block sequences ─────────────────────────────────────────────
+    check_text("seq/two", look("- 1\n- 2\n", "[1]"), "2");
+    check_text("seq/of strings", look("- a\n- b\n", "[0]"), "\"a\"");
+    check_text("seq/nested", look("- - 1\n  - 2\n- 3\n", "[0][1]"), "2");
+    check_text("seq/of mappings", look("- a: 1\n  b: 2\n- a: 3\n  b: 4\n", "[1].b"), "4");
+    check_text("seq/compact mapping", look("- name: x\n  n: 1\n- name: y\n  n: 2\n", "[0].name"), "\"x\"");
+    check_text("seq/empty", look("a: []\n", "a"), "[]");
+    check_text("seq/in a mapping", look("a:\n  - 1\n  - 2\n", "a[1]"), "2");
+    check_text("seq/mixed", look("- 1\n- a\n- true\n- null\n", "[3]"), "null");
+
+    // ─── Flow collections ─────────────────────────────────────────────
+    check_text("flow/sequence", look("a: [1, 2, 3]\n", "a[2]"), "3");
+    check_text("flow/empty sequence", look("a: []\n", "a"), "[]");
+    check_text("flow/mapping", look("a: {b: 1, c: two}\n", "a.c"), "\"two\"");
+    check_text("flow/empty mapping", look("a: {}\n", "a"), "{}");
+    check_text("flow/nested", look("a: {b: [1, {c: 2}]}\n", "a.b[1].c"), "2");
+    check_text("flow/quoted key", look("a: {'b c': 1}\n", "a.b c"), "1");
+    check_text("flow/over lines", look("a: [\n  1,\n  2,\n]\n", "a[1]"), "2");
+    check_text("flow/trailing comma", look("a: [1, 2, ]\n", "a[0]"), "1");
+
+    // ─── Scalars ──────────────────────────────────────────────────────
+    check_text("scalar/plain", look("a: hello\n", "a"), "\"hello\"");
+    check_text("scalar/single quoted", look("a: 'it''s'\n", "a"), "\"it's\"");
+    check_text("scalar/double quoted", look("a: \"a\\tb\\n\"\n", "a"), "\"a\tb\n\"");
+    check_text("scalar/unicode escape", look("a: \"\\u00e9\"\n", "a"), "\"é\"");
+    check_text("scalar/long escape", look("a: \"\\U0001F30D\"\n", "a"), "\"🌍\"");
+    check_text("scalar/number as string", look("a: '123'\n", "a"), "\"123\"");
+    check_text("scalar/bool as string", look("a: 'true'\n", "a"), "\"true\"");
+    check_text("scalar/literal block", look("a: |\n  one\n  two\n", "a"), "\"one\ntwo\n\"");
+    check_text("scalar/literal keeps space", look("a: |\n  one\n   two\n", "a"), "\"one\n two\n\"");
+    check_text("scalar/literal strip", look("a: |-\n  one\n  two\n", "a"), "\"one\ntwo\"");
+    check_text("scalar/literal keep", look("a: |+\n  one\n\n", "a"), "\"one\n\n\"");
+    check_text("scalar/folded block", look("a: >\n  one\n  two\n", "a"), "\"one two\n\"");
+    check_text("scalar/folded blank", look("a: >\n  one\n\n  two\n", "a"), "\"one\ntwo\n\"");
+    check_text("scalar/plain over lines", look("a: one\n  two\n", "a"), "\"one two\"");
+    check_text("scalar/empty", look("a: ''\n", "a"), "\"\"");
+    check_text("scalar/null forms", look("a: ~\n", "a"), "null");
+    check_text("scalar/null word", look("a: null\n", "a"), "null");
+    check_text("scalar/null caps", look("a: Null\n", "a"), "null");
+    check_text("scalar/true", look("a: true\n", "a"), "true");
+    check_text("scalar/false caps", look("a: FALSE\n", "a"), "false");
+
+    // ─── Numbers ──────────────────────────────────────────────────────
+    check_text("int/decimal", look("a: 1\n", "a"), "1");
+    check_text("int/negative", look("a: -17\n", "a"), "-17");
+    check_text("int/plus", look("a: +99\n", "a"), "99");
+    check_text("int/underscores", look("a: 1_000\n", "a"), "1000");
+    check_text("int/hex", look("a: 0x1F\n", "a"), "31");
+    check_text("int/octal", look("a: 0o17\n", "a"), "15");
+    check_text("int/binary", look("a: 0b1010\n", "a"), "10");
+    check_text("int/hex negative", look("a: -0x10\n", "a"), "-16");
+    check_text("int/max", look("a: 9223372036854775807\n", "a"), "9223372036854775807");
+    check_text("float/whole", look("a: 1.0\n", "a"), "1.0");
+    check_text("float/frac", look("a: 3.1415\n", "a"), "3.1415");
+    check_text("float/exponent", look("a: 5e+22\n", "a"), "5e+22");
+    check_text("float/small exponent", look("a: 2.5e-1\n", "a"), "0.25");
+    check_text("float/underscores", look("a: 1_000.5\n", "a"), "1000.5");
+    check_text("float/inf", look("a: .inf\n", "a"), ".inf");
+    check_text("float/negative inf", look("a: -.inf\n", "a"), "-.inf");
+    check_text("float/nan", look("a: .nan\n", "a"), ".nan");
+    check_text("float/point kept", look("a: 5.0e3\n", "a"), "5000.0");
+    check_text("float/leading dot", look("a: .5\n", "a"), "0.5");
+
+    // ─── Tags ─────────────────────────────────────────────────────────
+    check_text("tag/str", look("a: !!str 123\n", "a"), "\"123\"");
+    check_text("tag/int on string", look("a: !!int '7'\n", "a"), "7");
+    check_text("tag/float on int", look("a: !!float 2\n", "a"), "2.0");
+    check_text("tag/bool", look("a: !!bool 'yes'\n", "a"), "true");
+    check_text("tag/null", look("a: !!null ~\n", "a"), "null");
+    check_text("tag/local", look("a: !local thing\n", "a"), "\"thing\"");
+    check_text("tag/seq", look("a: !!seq [1, 2]\n", "a[1]"), "2");
+    check_text("tag/map", look("a: !!map {b: 1}\n", "a.b"), "1");
+    check_text("tag/timestamp", look("a: !!timestamp 2001-12-14\n", "a"), "\"2001-12-14\"");
+
+    // ─── Anchors and aliases ──────────────────────────────────────────
+    check_text("anchor/scalar", look("a: &x 1\nb: *x\n", "b"), "1");
+    check_text("anchor/mapping", look("base: &b\n  n: 1\nuse: *b\n", "use.n"), "1");
+    check_text("anchor/sequence", look("a: &s [1, 2]\nb: *s\n", "b[1]"), "2");
+    check_text("anchor/two aliases", look("a: &v 7\nb: *v\nc: *v\n", "c"), "7");
+    check_text("anchor/inside a sequence", look("- &one 1\n- *one\n", "[1]"), "1");
+    check_text("anchor/mapping in a sequence", look("- &m\n  n: 1\n- *m\n", "[1].n"), "1");
+
+    // ─── Documents ────────────────────────────────────────────────────
+    check_text("doc/bare", look("a: 1\n", "a"), "1");
+    check_text("doc/markers", look("---\na: 1\n", "a"), "1");
+    check_text("doc/closed", look("---\na: 1\n...\n", "a"), "1");
+    check_text("doc/scalar document", root_text("---\nhello\n"), "\"hello\"");
+    check_text("doc/sequence document", look("---\n- 1\n- 2\n", "[1]"), "2");
+    check_text("doc/directive", look("%YAML 1.2\n---\na: 1\n", "a"), "1");
+    check_text("doc/directive before the first document", look("%YAML 1.2\n%TAG !e! tag:example.com,2000:app/\n---\na: !e!thing 1\n", "a"), "\"1\"");
+    // A marker may carry the document's own node on its line.
+    check_text("doc/inline scalar", root_text("--- hello\n"), "\"hello\"");
+    check_text("doc/inline mapping", look("--- a: 1\n", "a"), "1");
+    check_text("doc/inline mapping with lines under it", look("--- a:\n  b: 1\n", "a"), "{ b: 1 }");
+    check_text("doc/inline sequence", look("--- [1, 2]\n", "[0]"), "1");
+    check_text("doc/inline sequence then lines", look("--- [1]\n", "[0]"), "1");
+    check_text("doc/inline flow mapping", look("--- {a: 1}\n", "a"), "1");
+    check_text("doc/inline then more lines", docs_count("--- a\n---\nb\n"), "2 documents");
+    check_text("doc/after the close", look("... a: 1\n", "a"), "1");
+    check_text("doc/close then document", docs_count("---\na: 1\n... b: 2\n"), "2 documents");
+    check_text("doc/inline tagged", root_text("--- !!str 7\n"), "\"7\"");
+    // An alias is a node anywhere, including inside a flow collection.
+    check_text("alias/flow sequence", root_text("a: &x [1, 2]\nb: *x\n"), "{ a: [1, 2], b: [1, 2] }");
+    check_text("alias/flow twice", root_text("a: &x {p: 1}\nb: [*x, *x]\n"), "{ a: { p: 1 }, b: [{ p: 1 }, { p: 1 }] }");
+    check_text("alias/flow mapping", root_text("a: &x 5\nb: {k: *x}\n"), "{ a: 5, b: { k: 5 } }");
+    check_text("alias/flow with a tag", root_text("a: &x 5\nb: [!!str *x]\n"), "{ a: 5, b: [5] }");
+    check_text("alias/flow nested in a flow", root_text("a: &x 5\nb: [[*x], {k: [*x]}]\n"), "{ a: 5, b: [[5], { k: [5] }] }");
+    check_text("alias/flow over lines", root_text("a: &x 5\nb: [\n  *x,\n  *x\n]\n"), "{ a: 5, b: [5, 5] }");
+    check_text("doc/stream/one", docs_count("a: 1\n"), "1 documents");
+    check_text("doc/stream/two", docs_count("---\na: 1\n---\nb: 2\n"), "2 documents");
+    check_text("doc/stream/three", docs_count("a: 1\n---\nb: 2\n---\nc: 3\n"), "3 documents");
+    check_text("doc/stream/closed", docs_count("---\na: 1\n...\n---\nb: 2\n"), "2 documents");
+
+    // ─── What the encoder writes ──────────────────────────────────────
+    check_text("write/struct", doc(to_yaml(Point {.x = 1, .y = 2})), "---\nx: 1\ny: 2\n");
+    check_text("write/sequence of mappings", doc(to_yaml(Outer {.title = "t", .items = [Inner {.name = "a", .n = 1}], .nums = []})),
+        "---\ntitle: t\nitems:\n- name: a\n  n: 1\nnums: []\n");
+    check_text("write/sequence of scalars", doc(to_yaml(Outer {.title = "t", .items = [], .nums = [1, 2]})),
+        "---\ntitle: t\nitems: []\nnums:\n- 1\n- 2\n");
+    check_text("write/kinds", doc(to_yaml(Kinds {.s = "a", .n = -1, .f = 1.5, .b = true})),
+        "---\ns: a\nn: -1\nf: 1.5\nb: true\n");
+    check_text("write/whole float", doc(to_yaml(Kinds {.s = "x", .n = 0, .f = 2.0, .b = false})),
+        "---\ns: x\nn: 0\nf: 2.0\nb: false\n");
+    // A string that reads as something else is quoted, so it reads back as
+    // itself.
+    check_text("write/strings", doc(to_yaml(Quoted {.a = "plain", .b = "123", .c = "true", .d = "a: b"})),
+        "---\na: plain\nb: '123'\nc: 'true'\nd: 'a: b'\n");
+    check_text("write/quotes", doc(to_yaml(Quoted {.a = "it's", .b = "say \"hi\"", .c = "a\nb", .d = ""})),
+        "---\na: it's\nb: say \"hi\"\nc: \"a\\nb\"\nd: ''\n");
+    check_text("write/empty struct fields", doc(to_yaml(Point {.x = 0, .y = 0})), "---\nx: 0\ny: 0\n");
+
+    return 0;
+}

@@ -1,0 +1,1550 @@
+// yaml_parse.resid — the YAML 1.2 grammar, parsed into a tree of nodes.
+import "../../resid-serial/src/serial.resid";
+//
+// The grammar is indentation-based, so a document is read line by line: a
+// line's indentation says which block it belongs to, and a block ends when
+// a line comes back out. Everything a node can be written as is collected
+// first, then the node itself is built from it, so an anchor may be defined
+// by a node that comes after an alias to it is resolved -- which YAML
+// forbids, and this reports.
+//
+// The tree keeps what was written, not what it means:
+//
+//   YScalar   a scalar with the style it was written in, so a string that
+//             looks like a number can be told from a number
+//   YSeq      a sequence, flow or block
+//   YMap      a mapping, flow or block
+//
+// Resolution to a bool, an int, a float, a null or a string is a separate
+// step (see yaml_resolve.resid), since it depends on the tags in play.
+
+import "yaml_text.resid";
+
+// ─── The tree ────────────────────────────────────────────────────────
+
+// A scalar as written: its text, and the style that text arrived in.
+type YStyle = YPlain | YSingle | YDouble | YLiteral | YFolded;
+
+type YScalar = {
+    Str text;
+    YStyle style;
+    Str tag;        // the tag it carried, or "" for none
+    Bool implicit;  // no tag was written, so the resolver decides
+};
+
+// A tag written on a node, or "" when none was.
+type YTagged = { Str tag; };
+
+// A sequence's items and a mapping's pairs, with the tag in front of them,
+// since a sum payload has to be a record.
+type YItems = { List(YNode) items; YTagged tagged; };
+
+type YEntries = { List(YPair) pairs; YTagged tagged; };
+
+type YNode = YScalarNode(YScalar) | YSeqNode(YItems) | YMapNode(YEntries);
+
+type YPair = { Str key; Str key_tag; YNode value; };
+
+// One document of a stream.
+type YDoc = {
+    YNode node;
+    Bool explicit_start;   // `---` opened it
+    Bool explicit_end;     // `...` closed it
+};
+
+// ─── Lines ───────────────────────────────────────────────────────────
+
+// A line: how deep it is indented, what is on it once the indentation and
+// any comment are gone, and where it ended. A blank line or a line of only
+// a comment is not a line at all.
+type YLine = {
+    Int indent;
+    Str text;
+    Int number;
+    Int end;
+    Bool blank;
+    Bool tabbed;   // a tab was used as indentation, which YAML does not allow
+};
+
+pub Result(List(YLine), SerialError) yaml_lines(Str in) {
+    return yaml_lines_at(in, 0, 1, []);
+}
+
+Result(List(YLine), SerialError) yaml_lines_at(Str in, Int i, Int number, List(YLine) acc) {
+    if (i >= str_len(in)) { return Ok(acc); }
+    Int stop = y_break(in, i);
+    YLine ln = y_line_of(in, i, stop, number);
+    Result(List(YLine), SerialError) more = yaml_lines_at(in, y_next_line(in, i), number + 1, acc.concat([ln]));
+    if (Err(e) = more) { return Err(e); }
+    if (Ok(ls) = more) { return Ok(ls); }
+    return Err(custom_error("unreachable"));
+}
+
+pub // Where the line own text ends, at its line break.
+Int y_break(Str in, Int i) {
+    if (i >= str_len(in)) { return str_len(in); }
+    Int c = str_char_at(in, i);
+    if (c == 10 || c == 13) { return i; }
+    return y_break(in, i + 1);
+}
+
+// Past the line break, so the next line starts there.
+pub Int y_next_line(Str in, Int i) {
+    Int stop = y_break(in, i);
+    if (stop >= str_len(in)) { return stop; }
+    Int c = str_char_at(in, stop);
+    if (c == 13 && y_at(in, stop + 1, 10)) { return stop + 2; }
+    return stop + 1;
+}
+
+YLine y_line_tabbed(YLine ln, Bool yes) {
+    return YLine {.indent = ln.indent, .text = ln.text, .number = ln.number, .end = ln.end, .blank = ln.blank, .tabbed = yes};
+}
+
+YLine y_line_of(Str in, Int start, Int stop, Int number) {
+    Int indent = y_indent(in, start, stop, 0);
+    Int body = y_skip_blank(in, start + indent, stop);
+    Str text = str_slice(in, body, stop);
+    Str trimmed = y_strip_comment(text, 0, StrBuf());
+    Str clean = str_slice(trimmed, 0, y_rtrim_end(trimmed, str_len(trimmed) - 1));
+    return y_line_tabbed(YLine {
+        .indent = indent,
+        .text = clean,
+        .number = number,
+        .end = stop,
+        .blank = str_len(clean) == 0
+    }, y_tabbed_before(in, start, stop));
+}
+
+// Whether the indentation before the text of a line has a tab in it.
+Bool y_tabbed_before(Str in, Int i, Int stop) {
+    if (i >= stop) { return false; }
+    Int c = str_char_at(in, i);
+    if (c == 9) { return true; }
+    if (c == 32) { return y_tabbed_before(in, i + 1, stop); }
+    return false;
+}
+
+Int y_indent(Str in, Int i, Int stop, Int seen) {
+    if (i >= stop) { return seen; }
+    Int c = str_char_at(in, i);
+    if (c == 32) { return y_indent(in, i + 1, stop, seen + 1); }
+    return seen;
+}
+
+Int y_skip_blank(Str in, Int i, Int stop) {
+    if (i >= stop) { return i; }
+    if (y_is_space(str_char_at(in, i))) { return y_skip_blank(in, i + 1, stop); }
+    return i;
+}
+
+// A `#` that starts a token is a comment: at the start of the text or after
+// a space. One inside a scalar is text.
+Str y_strip_comment(Str s, Int i, StrBuf b) {
+    return y_strip_more(s, i, b).finish();
+}
+
+// The walk itself, holding the builder open so a quoted scalar inside it
+// can keep filling the same one.
+StrBuf y_strip_more(Str s, Int i, StrBuf b) {
+    if (i >= str_len(s)) { return b; }
+    Int c = str_char_at(s, i);
+    if (c == 39 || c == 34) {
+        Int stop = y_quote_end(s, i + 1, c);
+        return y_strip_more(s, stop, y_strip_quoted(s, i, stop, b));
+    }
+    if (c == 35 && (i == 0 || y_is_space(str_char_at(s, i - 1)))) { return b; }
+    return y_strip_more(s, i + 1, b.push_char(c));
+}
+
+// Copies a quoted scalar through to its closing quote, so a `#` inside it
+// stays text.
+StrBuf y_strip_quoted(Str s, Int i, Int stop, StrBuf b) {
+    if (i >= stop || i >= str_len(s)) { return b; }
+    if (str_char_at(s, i) == 92 && stop - i > 1) { return y_strip_quoted(s, i + 2, stop, b.push(str_slice(s, i, i + 2))); }
+    return y_strip_quoted(s, i + 1, stop, b.push_char(str_char_at(s, i)));
+}
+
+// Whether a quoted scalar is closed: y_quote_end cannot say, because a
+// quote that ends the text and one that was never closed land on the same
+// index.
+Bool y_quote_closes(Str s, Int i, Int quote) {
+    if (i >= str_len(s)) { return false; }
+    Int c = str_char_at(s, i);
+    if (c == quote) {
+        if (quote == 39 && y_at(s, i + 1, 39)) { return y_quote_closes(s, i + 2, quote); }
+        return true;
+    }
+    if (c == 92 && quote == 34) { return y_quote_closes(s, i + 2, quote); }
+    return y_quote_closes(s, i + 1, quote);
+}
+
+Int y_quote_end(Str s, Int i, Int quote) {
+    if (i >= str_len(s)) { return str_len(s); }
+    Int c = str_char_at(s, i);
+    if (c == quote) {
+        if (quote == 39 && y_at(s, i + 1, 39)) { return y_quote_end(s, i + 2, quote); }
+        return i + 1;
+    }
+    if (c == 92 && quote == 34) { return y_quote_end(s, i + 2, quote); }
+    return y_quote_end(s, i + 1, quote);
+}
+
+// Where the text ends once the spaces at its end are gone.
+Int y_rtrim_end(Str s, Int i) {
+    if (i < 0) { return 0; }
+    if (y_is_space(str_char_at(s, i))) { return y_rtrim_end(s, i - 1); }
+    return i + 1;
+}
+
+// Whether a node is a scalar, a sequence or a mapping.
+pub Bool y_is_scalar(YNode n) { return match n { YScalarNode(_) => true, _ => false }; }
+
+pub Bool y_is_seq(YNode n) { return match n { YSeqNode(_) => true, _ => false }; }
+
+pub Bool y_is_map(YNode n) { return match n { YMapNode(_) => true, _ => false }; }
+
+// A node with the tag and anchor of the line it was written on, which is
+// how `!!str 123` and `&a value` keep theirs.
+pub YNode y_retag(YNode node, YProps p) {
+    Str tag = p.tag;
+    if (!p.tagged) { return node; }
+    YNode out = if (y_is_scalar(node)) {
+        YScalar s = y_scalar(node);
+        YScalarNode(YScalar {.text = s.text, .style = s.style, .tag = tag, .implicit = false})
+    } else { y_flow_tagged(node, p) };
+    return out;
+}
+
+// What a node holds, read out of the sum.
+pub List(YNode) y_items(YNode n) {
+    YItems got = match n { YSeqNode(x) => x, _ => YItems {.items = [], .tagged = YTagged {.tag = ""}} };
+    return got.items;
+}
+
+pub List(YPair) y_pairs(YNode n) {
+    YEntries got = match n { YMapNode(x) => x, _ => YEntries {.pairs = [], .tagged = YTagged {.tag = ""}} };
+    return got.pairs;
+}
+
+pub YScalar y_scalar(YNode n) {
+    YScalar empty = YScalar {.text = "", .style = YPlain, .tag = "", .implicit = true};
+    YScalar got = match n { YScalarNode(x) => x, _ => empty };
+    return got;
+}
+
+pub Str y_tag(YNode n) {
+    Str got = match n {
+        YScalarNode(x) => x.tag,
+        YSeqNode(x) => x.tagged.tag,
+        YMapNode(x) => x.tagged.tag
+    };
+    return got;
+}
+
+// ─── Anchors and aliases ─────────────────────────────────────────────
+
+// An anchor and the line its node starts on. Anchors are collected before
+// the document is parsed, so an alias can be resolved wherever it is
+// written, and a node that refers to itself is caught by the depth the
+// resolution goes to.
+type YAnchorRef = { Str name; Int line; Int column; };
+
+// The document's own names: its anchors, and the tag handles its `%TAG`
+// directives have declared, which say what a `!e!name` tag stands for.
+type YAnchors = { List(Str) names; List(YAnchorRef) refs; Int depth; List(Str) handles; List(Str) prefixes; };
+
+pub YAnchors y_anchors() { return YAnchors {.names = [], .refs = [], .depth = 0, .handles = [], .prefixes = []}; }
+
+// With one more tag handle, which a `%TAG` directive declares.
+YAnchors y_handle_add(YAnchors a, Str handle, Str prefix) {
+    return YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth, .handles = a.handles.concat([handle]), .prefixes = a.prefixes.concat([prefix])};
+}
+
+// The prefix a tag handle means, or "" when the document has not declared
+// it, which is an error at the tag rather than here.
+Str y_handle_prefix(YAnchors a, Str handle, Int i) {
+    if (i >= a.handles.len()) { return ""; }
+    if (a.handles[i] == handle) { return a.prefixes[i]; }
+    return y_handle_prefix(a, handle, i + 1);
+}
+
+// Every anchor in the document, found by looking for `&name` where a node
+// may start: at the head of a line, after a `-` or a `key:`, or after a
+// `[` or `{` inside a flow collection.
+Result(YAnchors, SerialError) y_anchor_scan(List(YLine) ls, Int i, Int stop, YAnchors a) {
+    if (i >= stop) { return Ok(a); }
+    YLine ln = ls[i];
+    if (ln.blank) { return y_anchor_scan(ls, i + 1, stop, a); }
+    Result(YAnchors, SerialError) more = y_anchor_line(ln, i, a);
+    if (Err(e) = more) { return Err(e); }
+    if (Ok(b) = more) { return y_anchor_scan(ls, i + 1, stop, b); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(YAnchors, SerialError) y_anchor_line(YLine ln, Int number, YAnchors a) {
+    return y_anchor_at(ln.text, 0, number, ln.indent, a);
+}
+
+// The anchors on one line, from the start of the line and after every
+// `- `, `key: ` and flow indicator, since a node may start at each of them.
+Result(YAnchors, SerialError) y_anchor_at(Str s, Int i, Int number, Int indent, YAnchors a) {
+    if (i >= str_len(s)) { return Ok(a); }
+    Int c = str_char_at(s, i);
+    if (c == 38) {
+        Int j = y_word_end(s, i + 1);
+        Str name = str_slice(s, i + 1, j);
+        if (str_len(name) == 0) { return Err(syntax_error("an anchor needs a name on line " + f"{number}")); }
+        Int at = y_anchor_column(s, j);
+        YAnchorRef ref = YAnchorRef {.name = name, .line = number, .column = at};
+        return y_anchor_at(s, j, number, indent, y_anchor_add(a, name, ref));
+    }
+    if (c == 39 || c == 34) { return y_anchor_at(s, y_quote_end(s, i + 1, c), number, indent, a); }
+    if (c == 45 || c == 63 || c == 58 || c == 44 || c == 91 || c == 93 || c == 123 || c == 125) {
+        return y_anchor_at(s, i + 1, number, indent, a);
+    }
+    return y_anchor_at(s, i + 1, number, indent, a);
+}
+
+// The column the anchored node starts at: past the anchor, and past a tag
+// that follows it.
+Int y_anchor_column(Str s, Int j) {
+    Int at = y_space_end(s, j);
+    if (at < str_len(s) && str_char_at(s, at) == 33) { return y_space_end(s, y_word_end(s, y_tag_bang(s, at + 1))); }
+    return at;
+}
+
+YAnchors y_anchor_add(YAnchors a, Str name, YAnchorRef ref) {
+    if (y_anchor_here(a, name, 0)) { return a; }
+    return YAnchors {.names = a.names.concat([name]), .refs = a.refs.concat([ref]), .depth = a.depth};
+}
+
+Bool y_anchor_here(YAnchors a, Str name, Int i) {
+    if (i >= a.names.len()) { return false; }
+    if (a.names[i] == name) { return true; }
+    return y_anchor_here(a, name, i + 1);
+}
+
+Int y_anchor_index(YAnchors a, Str name, Int i, Int found) {
+    if (i >= a.names.len()) { return found; }
+    if (a.names[i] == name) { return i; }
+    return y_anchor_index(a, name, i + 1, found);
+}
+
+// ─── Properties: a tag and an anchor ─────────────────────────────────
+
+// What a node carries before it is a node: an anchor, a tag, or nothing.
+// They may come in either order, and more than once.
+type YProps = { Str anchor; Str tag; Bool tagged; };
+
+pub YProps y_props() { return YProps {.anchor = "", .tag = "", .tagged = false}; }
+
+// Reads the anchor and tag a node starts with, and what is left of the
+// line. An alias is a node of its own, so it is reported here too.
+type YHead = { YProps props; Int rest; Int alias; };
+
+Result(YHead, SerialError) y_read_props(Str s, Int i, YAnchors a) {
+    Result(YHead, SerialError) first = y_prop_one(s, y_space_end(s, i), 0, "", "", false, a);
+    if (Err(e) = first) { return Err(e); }
+    if (Ok(h) = first) { return y_read_props_again(s, h, 0, a); }
+    return Err(custom_error("unreachable"));
+}
+
+Result(YHead, SerialError) y_read_props_again(Str s, YHead h, Int seen, YAnchors a) {
+    if (seen > 8) { return Err(syntax_error("too many tags and anchors in a row")); }
+    Result(YHead, SerialError) more = y_prop_one(s, h.rest, seen, h.props.anchor, h.props.tag, h.props.tagged, a);
+    if (Err(e) = more) { return Err(e); }
+    if (Ok(h2) = more) {
+        if (h2.rest <= h.rest) { return Ok(h2); }
+        return y_read_props_again(s, h2, seen + 1, a);
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// One `&anchor` or `!tag`, or the line unchanged when there is neither.
+Result(YHead, SerialError) y_prop_one(Str s, Int i, Int seen, Str anchor, Str tag, Bool tagged, YAnchors a) {
+    Int c = str_char_at(s, i);
+    if (c == 38) { return y_anchor_prop(s, i, seen, tag, tagged); }
+    if (c == 33) { return y_tag_prop(s, i, seen, anchor, tagged, a); }
+    YProps p = YProps {.anchor = anchor, .tag = tag, .tagged = tagged};
+    return Ok(YHead {.props = p, .rest = i, .alias = 0 - 1});
+}
+
+Result(YHead, SerialError) y_anchor_prop(Str s, Int i, Int seen, Str tag, Bool tagged) {
+    Int j = y_word_end(s, i + 1);
+    if (j == i + 1) { return Err(syntax_error("an anchor needs a name at " + f"{i}")); }
+    YProps p = YProps {.anchor = str_slice(s, i + 1, j), .tag = tag, .tagged = tagged};
+    return Ok(YHead {.props = p, .rest = j, .alias = 0 - 1});
+}
+
+// `!`, `!!suffix` or `!handle!suffix`.
+Result(YHead, SerialError) y_tag_prop(Str s, Int i, Int seen, Str anchor, Bool tagged, YAnchors a) {
+    Int j = y_tag_bang(s, i + 1);
+    Int k = y_tag_handle(s, y_word_end(s, j));
+    Str name = str_slice(s, i, k);
+    if (str_len(name) < 2) { return Err(syntax_error("a tag needs a name at " + f"{i}")); }
+    Result(Str, SerialError) full = y_tag_uri(a, name, i);
+    if (Err(e) = full) { return Err(e); }
+    if (Ok(uri) = full) {
+        YProps p = YProps {.anchor = anchor, .tag = uri, .tagged = true};
+        return Ok(YHead {.props = p, .rest = k, .alias = 0 - 1});
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// What a written tag stands for: `!` is the document's own, `!!suffix` is
+// the standard `tag:yaml.org,2002:` one, and `!handle!name` is whatever
+// prefix the document declared for that handle.
+Result(Str, SerialError) y_tag_uri(YAnchors a, Str name, Int at) {
+    if (name == "!") { return Ok(name); }
+    if (y_at(name, 1, 33)) { return Ok("tag:yaml.org,2002:" + str_slice(name, 2, str_len(name))); }
+    Int bang = y_bang_at(name, 1, 0 - 1);
+    if (bang < 0) { return Ok(name); }
+    Str handle = str_slice(name, 0, bang + 1);
+    Str prefix = y_handle_prefix(a, handle, 0);
+    if (str_len(prefix) == 0) { return Err(syntax_error("the tag handle `" + handle + "` has no %TAG directive")); }
+    return Ok(prefix + str_slice(name, bang + 1, str_len(name)));
+}
+
+Int y_space_end(Str s, Int i) {
+    if (i >= str_len(s)) { return i; }
+    if (y_is_space(str_char_at(s, i))) { return y_space_end(s, i + 1); }
+    return i;
+}
+
+// A `!handle!suffix` tag: the name runs past the second `!`.
+// The tag's name ends at the `!` that closes a named handle's prefix, and
+// at the end of the word after it: a tag suffix is one word, so a space
+// after it is the value's, not the tag's.
+Int y_tag_handle(Str s, Int k) {
+    if (k >= str_len(s) || str_char_at(s, k) != 33) { return k; }
+    return y_word_end(s, k + 1);
+}
+
+// Past the second `!` of `!!suffix`, if it is there.
+Int y_tag_bang(Str s, Int i) { if (y_at(s, i, 33)) { return i + 1; } return i; }
+
+Int y_word_end(Str s, Int i) {
+    if (i >= str_len(s)) { return i; }
+    Int c = str_char_at(s, i);
+    if (c == 45 || c == 95 || y_is_alpha(c) || y_is_digit(c) || c == 46 || c == 47) { return y_word_end(s, i + 1); }
+    return i;
+}
+
+// ─── Block collections ───────────────────────────────────────────────
+
+// Text gathered from the lines of a block, and the line it stopped at.
+type YRun = { Str text; Int upto; };
+
+// A block that was read, and the first line it did not take: a block ends
+// where a line comes back out of it, so the line after it belongs to
+// whatever holds it.
+type YBlock = { YNode node; Int upto; };
+
+// The node of the block that starts at line i, written at column `indent`.
+pub Result(YBlock, SerialError) y_node_at(List(YLine) ls, Int i, Int stop, Int indent, YAnchors a) {
+    Int k = y_next_content(ls, i, stop);
+    if (k >= stop) { return Ok(YBlock {.node = y_null_node(), .upto = k}); }
+    if (ls[k].tabbed) { return Err(y_error(ls, k, "a tab may not be used as indentation")); }
+    Str text = ls[k].text;
+    Int c = str_char_at(text, 0);
+    if (c == 45 && y_entry_dash(text)) { return y_seq_at(ls, i, stop, indent, a); }
+    // A flow collection is read as one, however many lines it takes: the
+    // `:` inside a flow mapping is not a mapping's, so the block reader
+    // must not be the one to see it.
+    if (c == 91 || c == 123) { return y_inline_value(ls, k, stop, indent, text, 0, a); }
+    if ((c == 63 && y_is_space_or_end(text, 1)) || y_key_colon(text) >= 0) { return y_map_at(ls, i, stop, indent, a); }
+    return y_scalar_line(ls, i, stop, indent, a);
+}
+
+Int y_next_content(List(YLine) ls, Int i, Int stop) {
+    if (i >= stop) { return i; }
+    if (ls[i].blank) { return y_next_content(ls, i + 1, stop); }
+    return i;
+}
+
+YNode y_null_node() {
+    YScalar s = YScalar {.text = "", .style = YPlain, .tag = "", .implicit = true};
+    return YScalarNode(s);
+}
+
+// `-` is an entry when it is alone or followed by a space.
+pub Bool y_entry_dash(Str text) {
+    if (str_len(text) == 1) { return true; }
+    return y_is_space(str_char_at(text, 1));
+}
+
+// Whether the text is a sequence entry: the `-` and the space after it.
+pub Bool y_starts_entry(Str text) {
+    if (str_len(text) == 0) { return false; }
+    if (str_char_at(text, 0) != 45) { return false; }
+    return y_entry_dash(text);
+}
+
+Bool y_is_space_or_end(Str s, Int i) {
+    if (i >= str_len(s)) { return true; }
+    return y_is_space(str_char_at(s, i));
+}
+
+// Where a mapping's `key:` is, or -1 when the line is not one.
+pub Int y_key_colon(Str text) {
+    return y_key_colon_at(text, 0, 0, 0 - 1);
+}
+
+Int y_key_colon_at(Str text, Int i, Int seen, Int found) {
+    if (i >= str_len(text)) { return found; }
+    Int c = str_char_at(text, i);
+    if (c == 39 || c == 34) {
+        Int stop = y_quote_end(text, i + 1, c);
+        return y_key_colon_at(text, stop, seen + 1, found);
+    }
+    if (c == 58) {
+        // A colon is the key's own when it is the first one, or the one
+        // straight after a quoted key.
+        if (y_is_space_or_end(text, i + 1)) { return if (seen < 2) { i } else { found }; }
+        return y_key_colon_at(text, i + 1, seen, found);
+    }
+    if (c == 35 && i > 0 && y_is_space(str_char_at(text, i - 1))) { return y_key_colon_at(text, i, seen, found); }
+    return y_key_colon_at(text, i + 1, seen, found);
+}
+
+// A sequence: one `- ` per line, each entry's value either on that line or
+// in the block indented under it.
+Result(YBlock, SerialError) y_seq_at(List(YLine) ls, Int i, Int stop, Int indent, YAnchors a) {
+    return y_seq_items(ls, i, stop, indent, a, []);
+}
+
+Result(YBlock, SerialError) y_seq_items(List(YLine) ls, Int i, Int stop, Int indent, YAnchors a, List(YNode) acc) {
+    Int k = y_next_content(ls, i, stop);
+    if (k >= stop || ls[k].indent < indent) { return Ok(YBlock {.node = YSeqNode(YItems {.items = acc, .tagged = YTagged {.tag = ""}}), .upto = k}); }
+    if (ls[k].indent > indent) { return Err(y_error(ls, k, "a sequence entry is indented too far")); }
+    Str text = ls[k].text;
+    if (!y_entry_dash(text)) { return Ok(YBlock {.node = YSeqNode(YItems {.items = acc, .tagged = YTagged {.tag = ""}}), .upto = k}); }
+    Int after = y_body_start(text, 1, 0);
+    Result(YBlock, SerialError) item = y_value_here(ls, k, stop, indent, after, a);
+    if (Err(e) = item) { return Err(e); }
+    if (Ok(b) = item) { return y_seq_items(ls, b.upto, stop, indent, a, acc.concat([b.node])); }
+    return Err(custom_error("unreachable"));
+}
+
+// What a line holds: a flow collection, a scalar, or nothing here, in
+// which case it is the block under the line. `after` is where the line's
+// own text starts, and the block under it is written deeper than `indent`.
+Result(YBlock, SerialError) y_value_here(List(YLine) ls, Int k, Int stop, Int indent, Int after, YAnchors a) {
+    Str text = ls[k].text;
+    Str rest = str_slice(text, after, str_len(text));
+    Int i = y_space_end(rest, 0);
+    if (i >= str_len(rest)) { return y_node_under(ls, k, stop, indent, a); }
+    // A mapping or a sequence may start on the value's own line, as in
+    // `- key: value`: then the lines under it belong to that node, so it is
+    // read as a block written at the column the line itself is at.
+    Str own = str_slice(rest, i, str_len(rest));
+    Int first = str_char_at(own, 0);
+    // A flow collection, a tag or an anchor goes to its own reader: the
+    // colon inside a flow mapping is not a mapping's.
+    Bool flow = (first == 91 || first == 123);
+    Bool props = (first == 38 || first == 33);
+    if (!flow && !props && (y_key_colon(own) >= 0 || y_starts_entry(own))) {
+        return y_node_from(ls, k, stop, indent, own, a);
+    }
+    return y_inline_value(ls, k, stop, indent, rest, i, a);
+}
+
+// The block that starts at the value's own text on line k, with the lines
+// under it as its own. The line is rewritten so the node starts at the
+// column the line is written at, which is what its indentation says.
+Result(YBlock, SerialError) y_node_from(List(YLine) ls, Int k, Int stop, Int indent, Str text, YAnchors a) {
+    YLine ln = ls[k];
+    // The node's own column is where its text starts, which for an entry is
+    // after the `- `, so the lines under it line up with it.
+    Int at = y_value_column(ls[k].text, indent);
+    YLine moved = YLine {.indent = at, .text = text, .number = ln.number, .end = ln.end, .blank = false};
+    List(YLine) moved_lines = y_set_line(ls, k, moved);
+    return y_node_at(moved_lines, k, stop, at, a);
+}
+
+// The column a line's value starts at: past a leading `- `, or the line's
+// own indentation.
+pub Int y_value_column(Str text, Int indent) {
+    if (str_len(text) > 0 && str_char_at(text, 0) == 45 && y_entry_dash(text)) { return indent + 2; }
+    return indent;
+}
+
+List(YLine) y_set_line(List(YLine) ls, Int k, YLine ln) {
+    if (k >= ls.len()) { return ls; }
+    return ls[0..k].concat([ln]).concat(ls[k + 1..ls.len()]);
+}
+
+// The block that starts under line k, if there is one: a line written at
+// the same column belongs to whatever holds this one, not to it.
+Result(YBlock, SerialError) y_node_under(List(YLine) ls, Int k, Int stop, Int indent, YAnchors a) {
+    Int j = y_next_content(ls, k + 1, stop);
+    if (j >= stop) { return Ok(YBlock {.node = y_null_node(), .upto = k + 1}); }
+    // A block under a key is written deeper than the key, except a
+    // sequence, which is written at the key's own column as often as not.
+    if (ls[j].indent < indent) { return Ok(YBlock {.node = y_null_node(), .upto = k + 1}); }
+    if (ls[j].indent == indent && !y_starts_entry(ls[j].text)) { return Ok(YBlock {.node = y_null_node(), .upto = k + 1}); }
+    return y_node_at(ls, j, stop, ls[j].indent, a);
+}
+
+// A block that is one plain scalar, which is a document that is just a
+// value.
+Result(YBlock, SerialError) y_scalar_line(List(YLine) ls, Int i, Int stop, Int indent, YAnchors a) {
+    Int k = y_next_content(ls, i, stop);
+    if (k >= stop) { return Ok(YBlock {.node = y_null_node(), .upto = k}); }
+    Result(YBlock, SerialError) own = y_inline_value(ls, k, stop, indent, ls[k].text, 0, a);
+    if (Err(e) = own) { return Err(e); }
+    if (Ok(b) = own) { return Ok(YBlock {.node = b.node, .upto = stop}); }
+    return Err(custom_error("unreachable"));
+}
+
+// A mapping: one `key: value` per line, with the value either on that line
+// or in the block indented under it.
+Result(YBlock, SerialError) y_map_at(List(YLine) ls, Int i, Int stop, Int indent, YAnchors a) {
+    return y_map_pairs(ls, i, stop, indent, a, []);
+}
+
+Result(YBlock, SerialError) y_map_pairs(List(YLine) ls, Int i, Int stop, Int indent, YAnchors a, List(YPair) acc) {
+    
+    Int k = y_next_content(ls, i, stop);
+    if (k >= stop || ls[k].indent < indent) { return Ok(YBlock {.node = y_map_node(acc), .upto = k}); }
+    if (ls[k].indent > indent) { return Err(y_error(ls, k, "a mapping key is indented too far")); }
+    Str text = ls[k].text;
+    // An explicit key: `? key` on one line and `: value` on the next, or
+    // both on the same line after the `?`.
+    if (str_char_at(text, 0) == 63 && y_is_space_or_end(text, 1)) { return y_explicit_pair(ls, k, stop, indent, a, acc); }
+    Int colon = y_key_colon(text);
+    if (colon < 0) { return Err(y_error(ls, k, "expected a `key: value` line")); }
+    Str key = y_key_text(text, 0, colon);
+    if (str_len(key) == 0) { return Err(y_error(ls, k, "a mapping key with nothing in it")); }
+    if (y_key_taken(acc, key, 0)) { return Err(y_error(ls, k, "the key `" + key + "` is set twice")); }
+    Int after = y_body_start(text, colon + 1, 0);
+    Result(YBlock, SerialError) value = y_value_here(ls, k, stop, indent, after, a);
+    if (Err(e) = value) { return Err(e); }
+    if (Ok(b) = value) {
+        YPair pair = YPair {.key = key, .key_tag = "", .value = b.node};
+        return y_map_pairs(ls, b.upto, stop, indent, a, acc.concat([pair]));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+YNode y_map_node(List(YPair) pairs) { return YMapNode(YEntries {.pairs = pairs, .tagged = YTagged {.tag = ""}}); }
+
+// An explicit `? key` / `: value` pair. The key may be a collection of its
+// own, which is read from the block under the `?`.
+Result(YBlock, SerialError) y_explicit_pair(List(YLine) ls, Int k, Int stop, Int indent, YAnchors a, List(YPair) acc) {
+    Str text = ls[k].text;
+    Str key = y_key_trim(text, 1, str_len(text));
+    Int next = y_explicit_value_at(ls, k, stop, indent);
+    if (next < 0) { return Err(y_error(ls, k, "an explicit key needs a `: value` line after it")); }
+    YLine vline = ls[next];
+    Str vtext = vline.text;
+    Int body = y_body_start(vtext, 1, 0);
+    Result(YBlock, SerialError) value = y_value_here(ls, next, stop, indent, body, a);
+    if (Err(e) = value) { return Err(e); }
+    if (Ok(b) = value) {
+        YPair pair = YPair {.key = key, .key_tag = "", .value = b.node};
+        return y_map_pairs(ls, b.upto, stop, indent, a, acc.concat([pair]));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// The line the `: value` of an explicit key is on, which is the next one
+// written at the same column.
+Int y_explicit_value_at(List(YLine) ls, Int k, Int stop, Int indent) {
+    Int j = y_next_content(ls, k + 1, stop);
+    if (j >= stop) { return 0 - 1; }
+    if (ls[j].indent != indent) { return 0 - 1; }
+    Str text = ls[j].text;
+    if (str_char_at(text, 0) != 58) { return 0 - 1; }
+    return j;
+}
+
+Bool y_key_taken(List(YPair) pairs, Str key, Int i) {
+    if (i >= pairs.len()) { return false; }
+    if (pairs[i].key == key) { return true; }
+    return y_key_taken(pairs, key, i + 1);
+}
+
+// The text of a key: a plain key as written, a quoted one unquoted.
+// A key that is written after a `?`, where the text is trimmed at its end.
+Str y_key_trim(Str text, Int i, Int colon) {
+    Str key = y_key_text(text, i, colon);
+    return str_slice(key, y_skip_lead(key, 0), str_len(key));
+}
+
+Int y_skip_lead(Str s, Int i) {
+    if (i >= str_len(s)) { return i; }
+    if (y_is_space(str_char_at(s, i))) { return y_skip_lead(s, i + 1); }
+    return i;
+}
+
+Str y_key_text(Str text, Int i, Int colon) {
+    Str raw = str_slice(text, i, colon);
+    Str trimmed = str_slice(raw, 0, y_rtrim_end(raw, str_len(raw) - 1));
+    return y_unquote(trimmed, 0, StrBuf());
+}
+
+Str y_unquote(Str s, Int i, StrBuf b) {
+    if (i >= str_len(s)) { return b.finish(); }
+    Int c = str_char_at(s, i);
+    if (c == 39) {
+        Void quoted = b.discard();
+        return y_single_body(s, i + 1, StrBuf());
+    }
+    if (c == 34) {
+        Void quoted = b.discard();
+        Result(Str, SerialError) r = y_double_of(s);
+        if (Err(e) = r) { return ""; }
+        if (Ok(v) = r) { return v; }
+        return "";
+    }
+    return y_unquote(s, i + 1, b.push_char(c));
+}
+
+// Inside a single-quoted scalar, where a quote is written twice.
+Str y_single_body(Str s, Int i, StrBuf b) {
+    return y_single_more(s, i, b).finish();
+}
+
+// The walk itself, so that the builder is still open for the next one.
+StrBuf y_single_more(Str s, Int i, StrBuf b) {
+    if (i >= str_len(s)) { return b; }
+    Int c = str_char_at(s, i);
+    if (c == 39) {
+        if (y_at(s, i + 1, 39)) { return y_single_more(s, i + 2, b.push_char(39)); }
+        return b;
+    }
+    return y_single_more(s, i + 1, b.push_char(c));
+}
+
+// Inside a double-quoted scalar, where the escapes are.
+// A double-quoted scalar, checked and then built. A builder cannot cross a
+// Result, and what is wrong with the escapes does not depend on the text,
+// so the check is its own walk and the build follows it.
+Result(Str, SerialError) y_double_body(Str s, Int i, StrBuf b) {
+    Result(Unit, SerialError) ok = y_double_ok(s, i);
+    if (Err(e) = ok) {
+        Void gone = b.discard();
+        return Err(e);
+    }
+    if (Ok(u) = ok) { return Ok(y_double_more(s, i, b).finish()); }
+    Void gone = b.discard();
+    return Err(custom_error("unreachable"));
+}
+
+// The check: every escape is one that means something, and every code point
+// one of them spells is a code point.
+Result(Unit, SerialError) y_double_ok(Str s, Int i) {
+    if (i >= str_len(s)) { return Ok(unit()); }
+    Int c = str_char_at(s, i);
+    if (c == 34) { return Ok(unit()); }
+    if (c == 92) { return y_escape_ok(s, i + 1); }
+    return y_double_ok(s, i + 1);
+}
+
+// One escape, and the check of the scalar after it.
+Result(Unit, SerialError) y_escape_ok(Str s, Int i) {
+    if (i >= str_len(s)) { return Err(syntax_error("a `\\` with nothing after it")); }
+    Int c = str_char_at(s, i);
+    if (c == 48) { return y_double_ok(s, i + 1); }
+    if (c == 97) { return y_double_ok(s, i + 1); }
+    if (c == 98) { return y_double_ok(s, i + 1); }
+    if (c == 116 || c == 9) { return y_double_ok(s, i + 1); }
+    if (c == 110) { return y_double_ok(s, i + 1); }
+    if (c == 118) { return y_double_ok(s, i + 1); }
+    if (c == 102) { return y_double_ok(s, i + 1); }
+    if (c == 114) { return y_double_ok(s, i + 1); }
+    if (c == 101) { return y_double_ok(s, i + 1); }
+    if (c == 32) { return y_double_ok(s, i + 1); }
+    if (c == 34) { return y_double_ok(s, i + 1); }
+    if (c == 47) { return y_double_ok(s, i + 1); }
+    if (c == 92) { return y_double_ok(s, i + 1); }
+    if (c == 78) { return y_double_ok(s, i + 1); }
+    if (c == 95) { return y_unicode_ok(s, i + 1, 4); }
+    if (c == 120) { return y_unicode_ok(s, i + 1, 2); }
+    if (c == 117) { return y_unicode_ok(s, i + 1, 4); }
+    if (c == 85) { return y_unicode_ok(s, i + 1, 8); }
+    return Err(syntax_error("unknown escape `\\" + str_from_code(c) + "`"));
+}
+
+// `\\xNN`, `\\UNNNNNNNN`: the code point the digits spell, if it is one.
+Result(Unit, SerialError) y_unicode_ok(Str s, Int i, Int width) {
+    Int cp = y_hex_cp(s, i, width, 0, 0);
+    if (cp < 0) { return Err(syntax_error("expected " + f"{width}" + " hex digits at " + f"{i}")); }
+    if (cp > 1114111 || (cp >= 55296 && cp <= 57343)) { return Err(syntax_error("a code point is not in range at " + f"{i}")); }
+    return y_double_ok(s, i + width);
+}
+
+// The build, which cannot fail: the check has been over it already.
+StrBuf y_double_more(Str s, Int i, StrBuf b) {
+    if (i >= str_len(s)) { return b; }
+    Int c = str_char_at(s, i);
+    if (c == 34) { return b; }
+    if (c == 92) { return y_escape_build(s, i + 1, b); }
+    return y_double_more(s, i + 1, b.push_char(c));
+}
+
+StrBuf y_escape_build(Str s, Int i, StrBuf b) {
+    Int c = str_char_at(s, i);
+    if (c == 48) { return y_double_more(s, i + 1, b.push_char(0)); }
+    if (c == 97) { return y_double_more(s, i + 1, b.push_char(7)); }
+    if (c == 98) { return y_double_more(s, i + 1, b.push_char(8)); }
+    if (c == 116 || c == 9) { return y_double_more(s, i + 1, b.push_char(9)); }
+    if (c == 110) { return y_double_more(s, i + 1, b.push_char(10)); }
+    if (c == 118) { return y_double_more(s, i + 1, b.push_char(11)); }
+    if (c == 102) { return y_double_more(s, i + 1, b.push_char(12)); }
+    if (c == 114) { return y_double_more(s, i + 1, b.push_char(13)); }
+    if (c == 101) { return y_double_more(s, i + 1, b.push_char(27)); }
+    if (c == 32) { return y_double_more(s, i + 1, b.push(" ")); }
+    if (c == 34) { return y_double_more(s, i + 1, b.push("\"")); }
+    if (c == 47) { return y_double_more(s, i + 1, b.push("/")); }
+    if (c == 92) { return y_double_more(s, i + 1, b.push("\\")); }
+    if (c == 78) { return y_double_more(s, i + 1, b.push_char(133)); }
+    // `i` is the escape letter, so the digits are the width after it.
+    Int width = if (c == 120) { 2 } else if (c == 85) { 8 } else { 4 };
+    return y_double_more(s, i + 1 + width, b.push_char(y_hex_cp(s, i + 1, width, 0, 0)));
+}
+
+
+// The walk itself, so that the builder is still open for the next one.
+
+
+
+
+
+Int y_hex_cp(Str s, Int i, Int width, Int seen, Int acc) {
+    if (seen >= width) { return acc; }
+    if (i >= str_len(s) || !y_is_hex(str_char_at(s, i))) { return 0 - 1; }
+    return y_hex_cp(s, i + 1, width, seen + 1, acc * 16 + y_hex_value(str_char_at(s, i)));
+}
+
+// Where the value after a `key:` or a `-` starts on the line.
+Int y_body_start(Str text, Int i, Int seen) {
+    if (i >= str_len(text)) { return i; }
+    if (y_is_space(str_char_at(text, i))) { return y_body_start(text, i + 1, seen); }
+    return i;
+}
+
+SerialError y_error(List(YLine) ls, Int at, Str why) {
+    return syntax_error(why + " on line " + f"{ls[at].number}");
+}
+
+// ─── Flow collections and scalars ─────────────────────────────────────
+
+// What is on the value's own line: a flow collection, a quoted or block
+// scalar, an alias, or a plain scalar that may run onto the lines under it.
+// None of them take a line after their own, except a plain scalar, which
+// takes the ones that continue it.
+Result(YBlock, SerialError) y_inline_value(List(YLine) ls, Int k, Int stop, Int indent, Str rest, Int i, YAnchors a) {
+    Int c = str_char_at(rest, i);
+    if (c == 91 || c == 123) { return y_flow_here(ls, k, stop, rest, i, a); }
+    if (c == 124 || c == 62) { return y_block_scalar(ls, k, stop, indent, rest, i, a); }
+    if (c == 42) { return y_here(y_alias_here(ls, rest, i, a), k); }
+    if (c == 39 || c == 34) { return y_here(y_quoted(rest, i, a), k); }
+    if (c == 38 || c == 33) { return y_props_here(ls, k, stop, indent, rest, i, a); }
+    return y_plain_value(ls, k, stop, indent, rest, i, a);
+}
+
+// A value that is all on its own line leaves the next line to whatever
+// holds it.
+Result(YBlock, SerialError) y_here(Result(YBlock, SerialError) b, Int k) {
+    if (Err(e) = b) { return Err(e); }
+    if (Ok(v) = b) { return Ok(YBlock {.node = v.node, .upto = k + 1}); }
+    return Err(custom_error("unreachable"));
+}
+
+// An anchor or a tag with nothing after it on the line: the node it names
+// is the block under the line.
+Result(YBlock, SerialError) y_props_here(List(YLine) ls, Int k, Int stop, Int indent, Str rest, Int i, YAnchors a) {
+    Result(YHead, SerialError) head = y_read_props(rest, i, a);
+    if (Err(e) = head) { return Err(e); }
+    if (Ok(h) = head) {
+        if (h.rest >= str_len(rest)) { return y_node_under(ls, k, stop, indent, a); }
+        // A tag or an anchor with a value after it: the value is read as it
+        // would be without them, at this line's own end.
+        Int at = y_space_end(rest, h.rest);
+        Str tail = str_slice(rest, at, str_len(rest));
+        Result(YBlock, SerialError) value = y_inline_value(ls, k, stop, indent, tail, 0, a);
+        if (Err(e) = value) { return Err(e); }
+        if (Ok(b) = value) { return Ok(YBlock {.node = y_retag(b.node, h.props), .upto = k + 1}); }
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// A quoted scalar on one line, with the tag and anchor in front of it.
+Result(YBlock, SerialError) y_quoted(Str rest, Int i, YAnchors a) {
+    Result(YHead, SerialError) head = y_read_props(rest, i, a);
+    if (Err(e) = head) { return Err(e); }
+    if (Ok(h) = head) {
+        if (h.rest >= str_len(rest)) { return Err(syntax_error("a quoted scalar with nothing in it")); }
+        Int c = str_char_at(rest, h.rest);
+        if (c != 39 && c != 34) { return Err(syntax_error("expected a quoted scalar")); }
+        if (!y_quote_closes(rest, h.rest + 1, c)) { return Err(syntax_error("a quoted scalar that is never closed")); }
+        Int stop = y_quote_end(rest, h.rest + 1, c);
+        Str body = str_slice(rest, h.rest, stop);
+        if (stop < str_len(rest) && !y_is_space(str_char_at(rest, stop))) {
+            return Err(syntax_error("text after a quoted scalar"));
+        }
+        Result(Str, SerialError) text = y_quoted_text(body, c);
+        if (Err(e) = text) { return Err(e); }
+        if (Ok(t) = text) {
+            YStyle style = if (c == 39) { YSingle } else { YDouble };
+            YScalar sc = y_scalar_of(t, style, h.props);
+            YNode node = YScalarNode(sc);
+            return Ok(YBlock {.node = y_anchored(node, h.props.anchor, a), .upto = 0});
+        }
+        return Err(custom_error("unreachable"));
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// A double-quoted scalar unquoted, or "" when its escapes do not parse.
+// A double-quoted scalar, quotes included: what the text says, or what is
+// wrong with it.
+// The text of a quoted scalar, quotes included, unescaping as its style
+// says. A malformed escape is an error here rather than an empty string.
+Result(Str, SerialError) y_quoted_text(Str body, Int quote) {
+    if (quote == 39) { return Ok(y_single_body(body, 1, StrBuf())); }
+    return y_double_of(body);
+}
+
+// A double-quoted scalar, quotes included: what the text says, or what is
+// wrong with it.
+Result(Str, SerialError) y_double_of(Str body) {
+    return y_double_body(body, 1, StrBuf());
+}
+
+// An alias as a value: the node it names, on the line it is written.
+Result(YBlock, SerialError) y_alias_here(List(YLine) ls, Str rest, Int i, YAnchors a) {
+    Result(YNode, SerialError) node = y_alias(ls, rest, i, a);
+    if (Err(e) = node) { return Err(e); }
+    if (Ok(n) = node) { return Ok(YBlock {.node = n, .upto = 0}); }
+    return Err(custom_error("unreachable"));
+}
+
+// An alias, which is the node the anchor names, parsed where the anchor
+// was written.
+Result(YNode, SerialError) y_alias(List(YLine) ls, Str rest, Int i, YAnchors a) {
+    Int j = y_word_end(rest, i + 1);
+    Str name = str_slice(rest, i + 1, j);
+    if (str_len(name) == 0) { return Err(syntax_error("an alias needs a name at " + f"{i}")); }
+    Int at = y_anchor_index(a, name, 0, 0 - 1);
+    if (at < 0) { return Err(syntax_error("the alias `*" + name + "` has no anchor")); }
+    if (a.depth > 32) { return Err(syntax_error("the anchor `&" + name + "` refers to itself")); }
+    YAnchorRef ref = a.refs[at];
+    Int n = ls.len();
+    YAnchors deeper = YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth + 1};
+    Result(YBlock, SerialError) block = y_anchor_node(ls, ref, n, deeper);
+    if (Err(e) = block) { return Err(e); }
+    if (Ok(b) = block) { return Ok(b.node); }
+    return Err(custom_error("unreachable"));
+}
+
+// The node an anchor names: what is left of the line it is on at its own
+// column, or the block under that line when the line holds nothing else.
+Result(YBlock, SerialError) y_anchor_node(List(YLine) ls, YAnchorRef ref, Int stop, YAnchors a) {
+    if (ref.line >= ls.len()) { return Err(syntax_error("the anchor `&" + ref.name + "` is on a line that is not there")); }
+    YLine ln = ls[ref.line];
+    Str text = str_slice(ln.text, ref.column, str_len(ln.text));
+    Int at = ln.indent + ref.column;
+    Int j = y_space_end(text, 0);
+    Str own = str_slice(text, j, str_len(text));
+    if (str_len(own) == 0 || str_char_at(own, 0) == 38 || str_char_at(own, 0) == 33) {
+        return y_node_under(ls, ref.line, stop, ln.indent, a);
+    }
+    YLine moved = YLine {.indent = at, .text = own, .number = ln.number, .end = ln.end, .blank = false};
+    List(YLine) moved_lines = y_set_line(ls, ref.line, moved);
+    return y_node_at(moved_lines, ref.line, stop, at, a);
+}
+
+// A node with an anchor on it is the node itself: the anchor is a name for
+// it in the table, which the alias reads.
+YNode y_anchored(YNode node, Str anchor, YAnchors a) {
+    YAnchors unused = a;
+    Str name = anchor;
+    return node;
+}
+
+// A plain scalar: what is on this line, folded with the plain lines under
+// it, since a line break in a plain scalar is a space.
+Result(YBlock, SerialError) y_plain_value(List(YLine) ls, Int k, Int stop, Int indent, Str rest, Int i, YAnchors a) {
+    Result(YHead, SerialError) head = y_read_props(rest, i, a);
+    if (Err(e) = head) { return Err(e); }
+    if (Ok(h) = head) {
+        Str own = str_slice(rest, h.rest, str_len(rest));
+        YRun run = y_plain_lines(ls, k + 1, stop, indent, 0, StrBuf());
+        Str text = y_fold_plain(own, run.text);
+        YScalar sc = y_scalar_of(text, YPlain, h.props);
+        YNode node = y_anchored(YScalarNode(sc), h.props.anchor, a);
+        return Ok(YBlock {.node = node, .upto = run.upto});
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// The plain lines that continue a plain scalar: deeper than the block that
+// holds it, and not a `key:` or a `- ` of their own.
+// The plain lines that continue a plain scalar, gathered into one builder
+// rather than a fresh string per line.
+YRun y_plain_lines(List(YLine) ls, Int i, Int stop, Int indent, Int seen, StrBuf b) {
+    if (i >= stop) { return YRun {.text = b.finish(), .upto = i}; }
+    YLine ln = ls[i];
+    if (ln.blank) { return y_plain_lines(ls, i + 1, stop, indent, seen, b); }
+    if (ln.indent <= indent) { return YRun {.text = b.finish(), .upto = i}; }
+    if (y_entry_dash(ln.text) || y_key_colon(ln.text) >= 0) { return YRun {.text = b.finish(), .upto = i}; }
+    StrBuf more = if (seen == 0) { b.push(ln.text) } else { b.push(" ").push(ln.text) };
+    return y_plain_lines(ls, i + 1, stop, indent, seen + 1, more);
+}
+
+// A plain scalar's own line, then the lines under it. A line break in a
+// plain scalar is a space, unless the line before it ended in a blank one.
+Str y_fold_plain(Str own, Str more) {
+    if (str_len(more) == 0) { return own; }
+    if (str_char_at(own, str_len(own) - 1) == 10) { return own + more; }
+    return own + " " + more;
+}
+
+YScalar y_scalar_of(Str text, YStyle style, YProps p) {
+    return YScalar {.text = text, .style = style, .tag = p.tag, .implicit = !p.tagged};
+}
+
+// A literal `|` or folded `>` block: the lines under it, at the block's own
+// indentation, with the chomping applied.
+Result(YBlock, SerialError) y_block_scalar(List(YLine) ls, Int k, Int stop, Int indent, Str rest, Int i, YAnchors a) {
+    Int c = str_char_at(rest, i);
+    Bool literal = (c == 124);
+    Int chomp = y_chomp_of(rest, i + 1, 0);
+    Int after = y_chomp_at(rest, i + 1);
+    Int explicit = y_explicit_indent(rest, after);
+    Int j = y_explicit_at(rest, after);
+    if (j < str_len(rest) && !y_is_space(str_char_at(rest, j))) { return Err(syntax_error("a block scalar takes only an indentation or a chomping indicator")); }
+    Result(YHead, SerialError) head = y_read_props(rest, i, a);
+    if (Err(e) = head) { return Err(e); }
+    if (Ok(h) = head) {
+        Int width = y_block_indent(ls, k, stop, indent, explicit, 0);
+        YRun run = y_block_lines(ls, k + 1, stop, width, StrBuf(), 0, literal, 0, false);
+        Str body = run.text;
+        Str text = y_chomp(body, chomp);
+        YStyle style = if (literal) { YLiteral } else { YFolded };
+        YScalar sc = y_scalar_of(text, style, h.props);
+        YNode node = y_anchored(YScalarNode(sc), h.props.anchor, a);
+        return Ok(YBlock {.node = node, .upto = run.upto});
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// The chomping indicator: `-` strips the trailing line breaks and `+` keeps
+// them all.
+Int y_chomp_of(Str rest, Int j, Int seen) {
+    if (y_at(rest, j, 45)) { return 0 - 1; }
+    if (y_at(rest, j, 43)) { return 1; }
+    return seen;
+}
+
+Int y_chomp_at(Str rest, Int j) {
+    if (y_at(rest, j, 45) || y_at(rest, j, 43)) { return j + 1; }
+    return j;
+}
+
+// An explicit indentation indicator, which is a digit.
+Int y_explicit_indent(Str rest, Int j) {
+    if (j < str_len(rest) && str_char_at(rest, j) >= 49 && str_char_at(rest, j) <= 57) { return str_char_at(rest, j) - 48; }
+    return 0;
+}
+
+Int y_explicit_at(Str rest, Int j) {
+    if (j < str_len(rest) && str_char_at(rest, j) >= 49 && str_char_at(rest, j) <= 57) { return j + 1; }
+    return j;
+}
+
+// The column a block scalar's lines are written at: its first non-blank
+// line, or the indicator when one was given.
+Int y_block_indent(List(YLine) ls, Int k, Int stop, Int indent, Int explicit, Int seen) {
+    if (explicit > 0) { return indent + explicit; }
+    if (k >= stop) { return indent + 1; }
+    Int j = y_next_content(ls, k + 1, stop);
+    if (j >= stop) { return indent + 1; }
+    Int at = ls[j].indent;
+    if (at <= indent) { return indent + 1; }
+    return at;
+}
+
+// The lines of a block scalar, with the block's own indentation removed and
+// the blank lines kept, since a blank line inside one is content. A literal
+// block keeps its line breaks; a folded one turns them into spaces.
+// The lines of a block scalar, gathered into one builder.
+// The lines of a block scalar, gathered into one builder. `broke` says the
+// text so far ends in a line break, which is what a fold looks at: a
+// builder cannot be asked what it holds.
+YRun y_block_lines(List(YLine) ls, Int i, Int stop, Int width, StrBuf b, Int seen, Bool literal, Int next, Bool broke) {
+    if (i >= stop) { return YRun {.text = y_fold_end(b, seen, broke), .upto = next}; }
+    YLine ln = ls[i];
+    if (ln.blank) { return y_block_lines(ls, i + 1, stop, width, b.push_char(10), seen + 1, literal, i + 1, true); }
+    if (ln.indent < width) { return YRun {.text = y_fold_end(b, seen, broke), .upto = i}; }
+    Str body = y_indent_of(ln, ln.text, width);
+    if (literal) {
+        return y_block_lines(ls, i + 1, stop, width, b.push(body).push_char(10), seen + 1, literal, i + 1, true);
+    }
+    StrBuf more = if (seen == 0 || broke) { b.push(body) } else { b.push(" ").push(body) };
+    return y_block_lines(ls, i + 1, stop, width, more, seen + 1, literal, i + 1, false);
+}
+
+
+// A literal block keeps its line breaks, one at the end of every line.
+// A literal block keeps every line break, so each line ends with one.
+// A literal block keeps every line break, so each line ends with one.
+StrBuf y_join_line(StrBuf b, Str body) {
+    return b.push(body).push_char(10);
+}
+
+// A folded block turns a line break between two non-empty, equally indented
+// lines into a space; a blank line keeps the break, which is what the "\n"
+// a blank line adds is for.
+// A folded block joins its lines with a space, unless the text so far
+// already ends in a line break.
+// A folded block joins its lines with a space, unless the text so far
+// already ends in a line break.
+StrBuf y_fold_line(StrBuf b, Str body, Bool broke) {
+    if (broke) { return b.push(body); }
+    return b.push(" ").push(body);
+}
+
+// A folded block's last line ends with the break the chomping then reads.
+// What a folded block ends with: a line break, unless it has one already or
+// has nothing in it at all.
+Str y_fold_end(StrBuf b, Int seen, Bool broke) {
+    if (seen == 0 || broke) { return b.finish(); }
+    return b.push_char(10).finish();
+}
+
+Str y_indent_of(YLine ln, Str text, Int width) {
+    Int extra = ln.indent - width;
+    if (extra <= 0) { return text; }
+    return y_spaces(extra, 0, StrBuf()) + text;
+}
+
+// The spaces of an indent.
+Str y_spaces(Int n, Int i, StrBuf b) {
+    if (i >= n) { return b.finish(); }
+    return y_spaces(n, i + 1, b.push_char(32));
+}
+
+// Chomping: keep one line break (the default), strip them all (`-`), or
+// keep every one of them (`+`).
+Str y_chomp(Str body, Int chomp) {
+    Str trimmed = y_chomp_end(body, str_len(body) - 1);
+    if (chomp == 0 - 1) { return trimmed; }
+    if (chomp == 1) { return body; }
+    if (str_len(trimmed) == 0) { return ""; }
+    return trimmed + "\n";
+}
+
+Str y_chomp_end(Str body, Int i) {
+    if (i < 0) { return ""; }
+    Int c = str_char_at(body, i);
+    if (c == 10 || c == 13) { return y_chomp_end(body, i - 1); }
+    return str_slice(body, 0, i + 1);
+}
+
+// ─── Documents ───────────────────────────────────────────────────────
+
+// One document of a stream. A stream is a document, or several separated
+// by `---`, each closed by `...` or by the next `---`.
+pub Result(List(YDoc), SerialError) yaml_docs(Str in) {
+    Result(List(YLine), SerialError) lines = yaml_lines(in);
+    if (Err(e) = lines) { return Err(e); }
+    if (Ok(ls) = lines) {
+        Result(YAnchors, SerialError) a = y_anchor_scan(ls, 0, ls.len(), y_anchors());
+        if (Err(e) = a) { return Err(e); }
+        if (Ok(anchors) = a) { return y_docs_at(ls, 0, ls.len(), anchors, [], false, 0); }
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// The documents from line i on. `started` says a `---` has opened the one
+// being read, so the lines before it were directives.
+Result(List(YDoc), SerialError) y_docs_at(List(YLine) ls, Int i, Int stop, YAnchors a, List(YDoc) acc, Bool started, Int seen) {
+    Int k = y_next_content(ls, i, stop);
+    if (k >= stop) { return Ok(acc); }
+    Str text = ls[k].text;
+    if (y_is_directive(text)) {
+        Result(YAnchors, SerialError) more = y_directive(ls[k], a);
+        if (Err(e) = more) { return Err(e); }
+        if (Ok(a2) = more) { return y_docs_at(ls, k + 1, stop, a2, acc, started, seen + 1); }
+        return Err(custom_error("unreachable"));
+    }
+    Int marker = y_marker(text);
+    Bool open = (marker == 45);
+    Bool close = (marker == 46);
+    // A marker may carry the document's first node on its own line, as in
+    // `--- [1, 2]`, which is a line of its own once the marker is off it.
+    Str tail = if (marker == 0) { "" } else { y_marker_tail(text) };
+    if (str_len(tail) > 0) {
+        // The document's node starts at column zero: what a marker line
+        // carries after the marker is written at the marker's own column,
+        // not at the column its text happens to begin in, so the lines
+        // under it are measured from there.
+        List(YLine) moved = y_set_line(ls, k, YLine {.indent = 0, .text = tail, .number = ls[k].number, .end = ls[k].end, .blank = false, .tabbed = ls[k].tabbed});
+        Int to2 = y_doc_end(moved, k + 1, stop);
+        Result(YBlock, SerialError) first = y_node_at(moved, k, to2, 0, a);
+        if (Err(e) = first) { return Err(e); }
+        if (Ok(fb) = first) {
+            YDoc one = YDoc {.node = fb.node, .explicit_start = open, .explicit_end = close};
+            return y_docs_at(moved, to2, stop, a, acc.concat([one]), started, seen + 1);
+        }
+        return Err(custom_error("unreachable"));
+    }
+    if (close) { return y_docs_at(ls, k + 1, stop, a, acc, started, seen); }
+    Int from = if (open) { k + 1 } else { k };
+    Int to = y_doc_end(ls, from, stop);
+    if (from >= to) {
+        if (open) { return y_docs_at(ls, k + 1, stop, a, acc.concat([empty_doc()]), started, seen + 1); }
+        return Ok(acc);
+    }
+    Int indent = ls[y_next_content(ls, from, to)].indent;
+    Result(YBlock, SerialError) block = y_node_at(ls, from, to, indent, a);
+    if (Err(e) = block) { return Err(e); }
+    if (Ok(b) = block) {
+        YDoc doc = YDoc {.node = b.node, .explicit_start = open, .explicit_end = false};
+        return y_docs_at(ls, to, stop, a, acc.concat([doc]), started, seen + 1);
+    }
+    return Err(custom_error("unreachable"));
+}
+
+YDoc empty_doc() {
+    YScalar s = YScalar {.text = "", .style = YPlain, .tag = "", .implicit = true};
+    return YDoc {.node = YScalarNode(s), .explicit_start = true, .explicit_end = false};
+}
+
+// Where a document ends: at a `---` or `...` on its own, or at a line
+// written back out to column zero that starts a new node.
+Int y_doc_end(List(YLine) ls, Int i, Int stop) {
+    if (i >= stop) { return stop; }
+    YLine ln = ls[i];
+    if (ln.blank) { return y_doc_end(ls, i + 1, stop); }
+    if (ln.indent == 0) {
+        Int m = y_marker(ln.text);
+        if (m == 45 || m == 46) { return i; }
+    }
+    return y_doc_end(ls, i + 1, stop);
+}
+
+// A `---` or `...` marker, or 0 when the line is not one.
+Int y_marker(Str text) {
+    if (str_len(text) < 3) { return 0; }
+    Int c = str_char_at(text, 0);
+    if (c != 45 && c != 46) { return 0; }
+    if (str_char_at(text, 1) != c || str_char_at(text, 2) != c) { return 0; }
+    if (str_len(text) > 3 && !y_is_space(str_char_at(text, 3))) { return 0; }
+    return c;
+}
+
+// What a marker line carries after the `---` or `...`, which is the
+// document's own node when it is there at all.
+Str y_marker_tail(Str text) {
+    Int i = y_space_end(text, 3);
+    if (i >= str_len(text)) { return ""; }
+    return str_slice(text, i, str_len(text));
+}
+
+Bool y_is_directive(Str text) { return str_char_at(text, 0) == 37; }
+
+// An error said of one line, for the places that have the line and not the
+// list it came from.
+SerialError y_line_error(YLine ln, Str why) { return syntax_error(why + " on line " + f"{ln.number}"); }
+
+// A directive: `%YAML 1.2` says the version, and `%TAG !e! prefix` says
+// what a tag handle stands for, which is the only directive that changes
+// how anything else in the document reads.
+Result(YAnchors, SerialError) y_directive(YLine ln, YAnchors a) {
+    Str text = ln.text;
+    if (!y_word_is(text, 1, "TAG")) { return Ok(a); }
+    Int i = y_space_end(text, 4);
+    Int open = y_bang_at(text, i, 0 - 1);
+    Int close = if (open < 0) { 0 - 1 } else { y_bang_at(text, open + 1, 0 - 1) };
+    if (close < 0) { return Err(y_line_error(ln, "a %TAG directive needs a handle like `!e!`")); }
+    Str handle = str_slice(text, i, close + 1);
+    Int k = y_space_end(text, close + 1);
+    Str prefix = str_slice(text, k, str_len(text));
+    if (str_len(prefix) == 0) { return Err(y_line_error(ln, "a %TAG directive needs a prefix for its handle")); }
+    return Ok(y_handle_add(a, handle, prefix));
+}
+
+// Whether the text from i on is the word, which ends where it does not go
+// on.
+Bool y_word_is(Str s, Int i, Str word) {
+    Int n = str_len(word);
+    if (i + n > str_len(s)) { return false; }
+    return str_slice(s, i, i + n) == word;
+}
+
+// The `!` at i on, or -1 when there is none.
+Int y_bang_at(Str s, Int i, Int found) {
+    if (i >= str_len(s)) { return found; }
+    if (str_char_at(s, i) == 33) { return i; }
+    return y_bang_at(s, i + 1, found);
+}
+
+// The one document a stream holds, or the first of several.
+pub Result(YDoc, SerialError) yaml_doc(Str in) {
+    Result(List(YDoc), SerialError) r = yaml_docs(in);
+    if (Err(e) = r) { return Err(e); }
+    if (Ok(ds) = r) {
+        if (ds.len() == 0) {
+            YScalar s = YScalar {.text = "", .style = YPlain, .tag = "", .implicit = true};
+            return Ok(YDoc {.node = YScalarNode(s), .explicit_start = false, .explicit_end = false});
+        }
+        return Ok(ds[0]);
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// ─── Flow collections ────────────────────────────────────────────────
+
+// A flow collection: `[a, b]` or `{a: b, c: d}`, which may run over several
+// lines, so the text is gathered from the line it starts on and the lines
+// under it until the collection closes.
+Result(YBlock, SerialError) y_flow_here(List(YLine) ls, Int k, Int stop, Str rest, Int i, YAnchors a) {
+    YRun run = y_flow_text(ls, k, stop, rest, i, StrBuf(), k);
+    Result(YHead, SerialError) head = y_read_props(rest, i, a);
+    if (Err(e) = head) { return Err(e); }
+    if (Ok(h) = head) {
+        Result(YNode, SerialError) node = y_flow_at(ls, run.text, h.rest, 0, a);
+        if (Err(e) = node) { return Err(e); }
+        if (Ok(n) = node) { return Ok(YBlock {.node = y_flow_tagged(n, h.props), .upto = run.upto}); }
+    }
+    return Err(custom_error("unreachable"));
+}
+
+YNode y_flow_tagged(YNode node, YProps p) {
+    if (!p.tagged) { return node; }
+    Str tag = p.tag;
+    YNode out = if (y_is_map(node)) {
+        List(YPair) pairs = y_pairs(node);
+        YMapNode(YEntries {.pairs = pairs, .tagged = YTagged {.tag = tag}})
+    } else { YSeqNode(YItems {.items = y_items(node), .tagged = YTagged {.tag = tag}}) };
+    return out;
+}
+
+// The flow's text: the rest of the line, then the lines under it while the
+// brackets are still open.
+// The text of a flow collection, which may run over several lines, gathered
+// into one builder.
+YRun y_flow_text(List(YLine) ls, Int k, Int stop, Str rest, Int i, StrBuf b, Int at) {
+    Str own = str_slice(rest, i, str_len(rest));
+    Int depth = y_flow_depth(own, 0, 0);
+    if (depth <= 0) { return YRun {.text = b.push(own).finish(), .upto = at + 1}; }
+    return y_flow_more(ls, k + 1, stop, b.push(own), depth, 0, k + 1);
+}
+
+YRun y_flow_more(List(YLine) ls, Int i, Int stop, StrBuf b, Int depth, Int seen, Int at) {
+    if (i >= stop) { return YRun {.text = b.finish(), .upto = i}; }
+    if (seen > 100) { return YRun {.text = b.finish(), .upto = i}; }
+    YLine ln = ls[i];
+    if (ln.blank) { return y_flow_more(ls, i + 1, stop, b, depth, seen + 1, at); }
+    StrBuf more = b.push(" ").push(ln.text);
+    Int open = y_flow_depth(ln.text, 0, depth);
+    if (open <= 0) { return YRun {.text = more.finish(), .upto = i + 1}; }
+    return y_flow_more(ls, i + 1, stop, more, open, seen + 1, at);
+}
+
+Bool y_ends_comma(Str acc) { return str_len(acc) > 0 && str_char_at(acc, str_len(acc) - 1) == 44; }
+
+// How many flow collections are still open after this text.
+Int y_flow_depth(Str s, Int i, Int depth) {
+    if (i >= str_len(s)) { return depth; }
+    Int c = str_char_at(s, i);
+    if (c == 39 || c == 34) { return y_flow_depth(s, y_quote_end(s, i + 1, c), depth); }
+    if (c == 35 && (i == 0 || y_is_space(str_char_at(s, i - 1)))) { return depth; }
+    if (c == 91 || c == 123) { return y_flow_depth(s, i + 1, depth + 1); }
+    if (c == 93 || c == 125) { return y_flow_depth(s, i + 1, depth - 1); }
+    return y_flow_depth(s, i + 1, depth);
+}
+
+// The flow node at `i` in the gathered text.
+Result(YNode, SerialError) y_flow_at(List(YLine) ls, Str s, Int i, Int depth, YAnchors a) {
+    Int j = y_space_end(s, i);
+    if (j >= str_len(s)) { return Err(syntax_error("a flow collection that never closes")); }
+    Int c = str_char_at(s, j);
+    if (c == 91) { return y_flow_seq(ls, s, j + 1, depth, a); }
+    if (c == 123) { return y_flow_map(ls, s, j + 1, depth, a); }
+    return y_flow_scalar(ls, s, j, depth, a);
+}
+
+Result(YNode, SerialError) y_flow_seq(List(YLine) ls, Str s, Int i, Int depth, YAnchors a) {
+    return y_flow_items(ls, s, i, depth, a, [], 0);
+}
+
+Result(YNode, SerialError) y_flow_items(List(YLine) ls, Str s, Int i, Int depth, YAnchors a, List(YNode) acc, Int seen) {
+    Int j = y_space_end(s, i);
+    if (j >= str_len(s)) { return Err(syntax_error("a flow sequence that never closes")); }
+    if (str_char_at(s, j) == 93) { return Ok(YSeqNode(YItems {.items = acc, .tagged = YTagged {.tag = ""}})); }
+    if (str_char_at(s, j) == 44) { return y_flow_items(ls, s, j + 1, depth, a, acc, seen + 1); }
+    Result(Parsed(YNode, Int), SerialError) one = y_flow_one(ls, s, j, depth, a);
+    if (Err(e) = one) { return Err(e); }
+    if (Ok(p) = one) {
+        return y_flow_items(ls, s, p.rest, depth, a, acc.concat([p.value]), seen + 1);
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// One element of a flow sequence or the key of a flow mapping: a node, then
+// where it ended.
+Result(Parsed(YNode, Int), SerialError) y_flow_one(List(YLine) ls, Str s, Int i, Int depth, YAnchors a) {
+    Int j = y_flow_entry_start(s, i, a);
+    Result(YNode, SerialError) node = y_flow_at(ls, s, j, depth, a);
+    if (Err(e) = node) { return Err(e); }
+    if (Ok(n) = node) { return parsed(n, y_flow_entry_end(s, j, depth, a)); }
+    return Err(custom_error("unreachable"));
+}
+
+// The tag or anchor in front of an element, if there is one.
+Int y_flow_entry_start(Str s, Int i, YAnchors a) {
+    Int j = y_space_end(s, i);
+    if (j >= str_len(s)) { return j; }
+    Int c = str_char_at(s, j);
+    if (c == 42) { return i; }
+    if (c == 38 || c == 33) {
+        Result(YHead, SerialError) h = y_read_props(s, j, a);
+        if (Ok(h2) = h) { return h2.rest; }
+    }
+    return j;
+}
+
+// Past the entry: a `,` or the closing bracket, since a flow scalar ends
+// where the next one of those is.
+Int y_flow_entry_end(Str s, Int i, Int depth, YAnchors a) {
+    if (i >= str_len(s)) { return i; }
+    Int c = str_char_at(s, i);
+    if (c == 44 || c == 93 || c == 125) { return i; }
+    if (c == 41) { return i; }
+    if (c == 91 || c == 123) { return y_close_at(s, i); }
+    if (c == 39 || c == 34) { return y_quote_end(s, i + 1, c); }
+    return y_flow_entry_end(s, i + 1, depth, a);
+}
+
+// Where the bracket that closes the one at `open` is, so the caller is
+// left looking at the `,` or the bracket that follows it.
+// Where the element that is a collection ends: just past its own closing
+// bracket, which is the `,` or the closer of the collection holding it.
+Int y_close_at(Str s, Int open) {
+    return y_flow_close(s, open);
+}
+
+// Past the bracket that closes the one at `open`.
+// Just past the bracket that closes the collection opened at `open`, which
+// is the index the reader of an element that is itself a collection goes on
+// from: the `,` or the closer that follows it.
+Int y_flow_close(Str s, Int open) {
+    Int stop = str_len(s);
+    return y_flow_scan(s, open + 1, 1, stop);
+}
+
+// The scan for it, starting inside the collection with one bracket open, so
+// the closer that ends it is the one at depth one.
+Int y_flow_scan(Str s, Int i, Int depth, Int stop) {
+    if (i >= str_len(s) || i >= stop) { return str_len(s); }
+    Int c = str_char_at(s, i);
+    if (c == 39 || c == 34) { return y_flow_scan(s, y_quote_end(s, i + 1, c), depth, stop); }
+    if (c == 91 || c == 123) { return y_flow_scan(s, i + 1, depth + 1, stop); }
+    if (c == 93 || c == 125) {
+        if (depth == 1) { return i + 1; }
+        return y_flow_scan(s, i + 1, depth - 1, stop);
+    }
+    return y_flow_scan(s, i + 1, depth, stop);
+}
+
+Result(YNode, SerialError) y_flow_map(List(YLine) ls, Str s, Int i, Int depth, YAnchors a) {
+    return y_flow_pairs(ls, s, i, depth, a, [], 0);
+}
+
+Result(YNode, SerialError) y_flow_pairs(List(YLine) ls, Str s, Int i, Int depth, YAnchors a, List(YPair) acc, Int seen) {
+    Int j = y_space_end(s, i);
+    if (j >= str_len(s)) { return Err(syntax_error("a flow mapping that never closes")); }
+    if (str_char_at(s, j) == 125) { return Ok(y_map_node(acc)); }
+    if (str_char_at(s, j) == 44) { return y_flow_pairs(ls, s, j + 1, depth, a, acc, seen + 1); }
+    Result(Parsed(Str, Int), SerialError) key = y_flow_key(s, j, a);
+    if (Err(e) = key) { return Err(e); }
+    if (Ok(k) = key) {
+        Int colon = y_flow_colon(s, k.rest);
+        if (colon < 0) { return Err(syntax_error("expected a `key: value` in a flow mapping")); }
+        Result(Parsed(YNode, Int), SerialError) value = y_flow_one(ls, s, y_space_end(s, colon + 1), depth, a);
+        if (Err(e) = value) { return Err(e); }
+        if (Ok(v) = value) {
+            YPair pair = YPair {.key = k.value, .key_tag = "", .value = v.value};
+            return y_flow_pairs(ls, s, v.rest, depth, a, acc.concat([pair]), seen + 1);
+        }
+    }
+    return Err(custom_error("unreachable"));
+}
+
+// A key inside a flow mapping, which ends at the `:` that follows it.
+Result(Parsed(Str, Int), SerialError) y_flow_key(Str s, Int i, YAnchors a) {
+    Int j = y_flow_entry_start(s, i, a);
+    if (j >= str_len(s)) { return Err(syntax_error("a flow mapping key with nothing after it")); }
+    Int c = str_char_at(s, j);
+    if (c == 39 || c == 34) {
+        Int stop = y_quote_end(s, j + 1, c);
+        Str body = str_slice(s, j, stop);
+        Result(Str, SerialError) text = y_quoted_text(body, c);
+        if (Err(e) = text) { return Err(e); }
+        if (Ok(t) = text) { return parsed(t, stop); }
+        return Err(custom_error("unreachable"));
+    }
+    Int end = y_flow_plain_end(s, j);
+    Str raw = str_slice(s, j, end);
+    return parsed(str_slice(raw, 0, y_rtrim_end(raw, str_len(raw) - 1)), end);
+}
+
+// A plain key in a flow mapping ends at the `:` that separates it from its
+// value, or at a flow indicator, since the key is a plain scalar.
+Int y_flow_plain_end(Str s, Int i) {
+    if (i >= str_len(s)) { return i; }
+    Int c = str_char_at(s, i);
+    if (c == 58) { return i; }
+    if (c == 44 || c == 93 || c == 125 || c == 123 || c == 91) { return i; }
+    return y_flow_plain_end(s, i + 1);
+}
+
+Int y_flow_colon(Str s, Int i) {
+    return y_flow_colon_at(s, i, 0 - 1);
+}
+
+Int y_flow_colon_at(Str s, Int i, Int found) {
+    if (i >= str_len(s)) { return found; }
+    Int c = str_char_at(s, i);
+    if (c == 44 || c == 125 || c == 93) { return found; }
+    if (c == 58) { return if (found < 0) { i } else { found }; }
+    return y_flow_colon_at(s, i + 1, found);
+}
+
+// A scalar inside a flow collection: quoted, an alias, or plain.
+Result(YNode, SerialError) y_flow_scalar(List(YLine) ls, Str s, Int i, Int depth, YAnchors a) {
+    Int c = str_char_at(s, i);
+    if (c == 39 || c == 34) {
+        Int stop = y_quote_end(s, i + 1, c);
+        Str body = str_slice(s, i, stop);
+        Result(Str, SerialError) text = y_quoted_text(body, c);
+        if (Err(e) = text) { return Err(e); }
+        if (Ok(t) = text) {
+            YStyle style = if (c == 39) { YSingle } else { YDouble };
+            return Ok(YScalarNode(YScalar {.text = t, .style = style, .tag = "", .implicit = true}));
+        }
+        return Err(custom_error("unreachable"));
+    }
+    // An alias names the node its anchor holds, wherever that node was
+    // written, so it is read where the anchor was.
+    if (c == 42) { return y_alias(ls, s, i, a); }
+    Int end = y_flow_value_end(s, i);
+    Str raw = str_slice(s, i, end);
+    Str text = str_slice(raw, 0, y_rtrim_end(raw, str_len(raw) - 1));
+    return Ok(YScalarNode(YScalar {.text = text, .style = YPlain, .tag = "", .implicit = true}));
+}
+
+Int y_flow_value_end(Str s, Int i) {
+    if (i >= str_len(s)) { return i; }
+    Int c = str_char_at(s, i);
+    if (c == 44 || c == 93 || c == 125) { return i; }
+    if (c == 58 && (i + 1 >= str_len(s) || y_is_space(str_char_at(s, i + 1)))) { return i; }
+    return y_flow_value_end(s, i + 1);
+}

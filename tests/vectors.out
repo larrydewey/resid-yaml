@@ -1,0 +1,117 @@
+ok   map/two keys
+ok   map/nested
+ok   map/indented one
+ok   map/quoted key
+ok   map/literal key
+ok   map/key with colon
+ok   map/explicit key
+ok   map/comment after
+ok   map/comment line
+ok   map/blank lines
+ok   map/empty value
+ok   seq/two
+ok   seq/of strings
+ok   seq/nested
+ok   seq/of mappings
+ok   seq/compact mapping
+ok   seq/empty
+ok   seq/in a mapping
+ok   seq/mixed
+ok   flow/sequence
+ok   flow/empty sequence
+ok   flow/mapping
+ok   flow/empty mapping
+ok   flow/nested
+ok   flow/quoted key
+ok   flow/over lines
+ok   flow/trailing comma
+ok   scalar/plain
+ok   scalar/single quoted
+ok   scalar/double quoted
+ok   scalar/unicode escape
+ok   scalar/long escape
+ok   scalar/number as string
+ok   scalar/bool as string
+ok   scalar/literal block
+ok   scalar/literal keeps space
+ok   scalar/literal strip
+ok   scalar/literal keep
+ok   scalar/folded block
+ok   scalar/folded blank
+ok   scalar/plain over lines
+ok   scalar/empty
+ok   scalar/null forms
+ok   scalar/null word
+ok   scalar/null caps
+ok   scalar/true
+ok   scalar/false caps
+ok   int/decimal
+ok   int/negative
+ok   int/plus
+ok   int/underscores
+ok   int/hex
+ok   int/octal
+ok   int/binary
+ok   int/hex negative
+ok   int/max
+ok   float/whole
+ok   float/frac
+ok   float/exponent
+ok   float/small exponent
+ok   float/underscores
+ok   float/inf
+ok   float/negative inf
+ok   float/nan
+ok   float/point kept
+ok   float/leading dot
+ok   tag/str
+ok   tag/int on string
+ok   tag/float on int
+ok   tag/bool
+ok   tag/null
+ok   tag/local
+ok   tag/seq
+ok   tag/map
+ok   tag/timestamp
+ok   anchor/scalar
+ok   anchor/mapping
+ok   anchor/sequence
+ok   anchor/two aliases
+ok   anchor/inside a sequence
+ok   anchor/mapping in a sequence
+ok   doc/bare
+ok   doc/markers
+ok   doc/closed
+ok   doc/scalar document
+ok   doc/sequence document
+ok   doc/directive
+ok   doc/directive before the first document
+ok   doc/inline scalar
+ok   doc/inline mapping
+ok   doc/inline mapping with lines under it
+ok   doc/inline sequence
+ok   doc/inline sequence then lines
+ok   doc/inline flow mapping
+ok   doc/inline then more lines
+ok   doc/after the close
+ok   doc/close then document
+ok   doc/inline tagged
+ok   alias/flow sequence
+ok   alias/flow twice
+ok   alias/flow mapping
+ok   alias/flow with a tag
+ok   alias/flow nested in a flow
+ok   alias/flow over lines
+ok   doc/stream/one
+ok   doc/stream/two
+ok   doc/stream/three
+ok   doc/stream/closed
+ok   write/struct
+ok   write/sequence of mappings
+ok   write/sequence of scalars
+ok   write/kinds
+ok   write/whole float
+ok   write/strings
+ok   write/quotes
+ok   write/empty struct fields
+exit 0
