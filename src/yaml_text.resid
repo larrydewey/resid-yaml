@@ -1,4 +1,4 @@
-import "../../resid-serial/src/serial.resid";
+import "resid-serial/serial.resid";
 
 // yaml_text.resid — how a YAML scalar is written, and when a plain one is
 // safe. A plain scalar is the readable form, so it is used wherever it

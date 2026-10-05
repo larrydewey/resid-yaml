@@ -1,5 +1,5 @@
 // yaml_parse.resid — the YAML 1.2 grammar, parsed into a tree of nodes.
-import "../../resid-serial/src/serial.resid";
+import "resid-serial/serial.resid";
 //
 // The grammar is indentation-based, so a document is read line by line: a
 // line's indentation says which block it belongs to, and a block ends when

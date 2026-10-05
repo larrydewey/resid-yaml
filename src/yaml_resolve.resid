@@ -1,5 +1,5 @@
 // yaml_resolve.resid — the resolver: what a scalar means, given its tag.
-import "../../resid-serial/src/serial.resid";
+import "resid-serial/serial.resid";
 //
 // YAML leaves that open. A plain scalar is a string unless it looks like
 // something else, and a tag says what it is whatever it looks like. This is
