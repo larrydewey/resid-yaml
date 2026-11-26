@@ -52,6 +52,17 @@ Int main() {
     check_text("keys/twice", count_of(numbered("k", ": 1\n", 0, 2000, StrBuf()) + "k7: 2\n"), "the key `k7` is set twice on line 2001");
     check_text("keys/twice in flow", count_of("{" + numbered("k", ": 1, ", 0, 2000, StrBuf()) + "k7: 2}"), "the key `k7` is set twice");
 
+    // The nesting limit, block and flow.
+    check("depth/limit is 64", yaml_max_depth() == 64);
+    check_text("depth/64 flow", shown(rep("[", 64, StrBuf()) + rep("]", 64, StrBuf())), rep("[", 64, StrBuf()) + rep("]", 64, StrBuf()));
+    check_text("depth/65 flow", shown(rep("[", 65, StrBuf()) + rep("]", 65, StrBuf())), "nested deeper than 64 levels");
+    check_text("depth/100000 flow", shown(rep("[", 100000, StrBuf())), "nested deeper than 64 levels");
+    check_text("depth/65 flow maps", shown(rep("{a: ", 65, StrBuf()) + "1" + rep("}", 65, StrBuf())), "nested deeper than 64 levels");
+    check_text("depth/64 block", count_of(rep("- ", 64, StrBuf()) + "1\n"), "1 items");
+    check_text("depth/65 block", count_of(rep("- ", 65, StrBuf()) + "1\n"), "nested deeper than 64 levels");
+    check_text("depth/65 keys", count_of(numbered("", "", 0, 0, StrBuf()) + y_indented(65)), "nested deeper than 64 levels");
+    check_text("depth/through an alias", count_of("a: &a " + rep("[", 40, StrBuf()) + rep("]", 40, StrBuf()) + "\nb: " + rep("[", 30, StrBuf()) + "*a" + rep("]", 30, StrBuf()) + "\n"), "nested deeper than 64 levels");
+
     return 0;
 }
 

@@ -249,13 +249,28 @@ type YAnchorRef = { Str name; Int line; Int column; };
 
 // The document's own names: its anchors, and the tag handles its `%TAG`
 // directives have declared, which say what a `!e!name` tag stands for.
-type YAnchors = { List(Str) names; List(YAnchorRef) refs; Int depth; List(Str) handles; List(Str) prefixes; };
+// `nest` is how many collections hold the node being read, which
+// yaml_max_depth bounds.
+type YAnchors = { List(Str) names; List(YAnchorRef) refs; Int depth; List(Str) handles; List(Str) prefixes; Int nest; };
 
-pub YAnchors y_anchors() { return YAnchors {.names = [], .refs = [], .depth = 0, .handles = [], .prefixes = []}; }
+pub YAnchors y_anchors() { return YAnchors {.names = [], .refs = [], .depth = 0, .handles = [], .prefixes = [], .nest = 0}; }
+
+/// How deeply sequences and mappings may nest in a document `from_yaml`
+/// and `yaml_docs` read, block and flow alike: 64. One nested deeper is a
+/// syntax error ("nested deeper than 64 levels"), raised where it opens, so
+/// the time and memory a parse takes stay bounded by the input. An alias
+/// counts from where it is written.
+pub Int yaml_max_depth() { return 64; }
+
+// One collection deeper: past the limit it is refused.
+Result(YAnchors, SerialError) y_nested(YAnchors a) {
+    if (a.nest >= yaml_max_depth()) { return Err(syntax_error(f"nested deeper than {yaml_max_depth()} levels")); }
+    return Ok(YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth, .handles = a.handles, .prefixes = a.prefixes, .nest = a.nest + 1});
+}
 
 // With one more tag handle, which a `%TAG` directive declares.
 YAnchors y_handle_add(YAnchors a, Str handle, Str prefix) {
-    return YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth, .handles = a.handles.concat([handle]), .prefixes = a.prefixes.concat([prefix])};
+    return YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth, .handles = a.handles.concat([handle]), .prefixes = a.prefixes.concat([prefix]), .nest = a.nest};
 }
 
 // The prefix a tag handle means, or "" when the document has not declared
@@ -313,7 +328,7 @@ Int y_anchor_column(Str s, Int j) {
 
 YAnchors y_anchor_add(YAnchors a, Str name, YAnchorRef ref) {
     if (y_anchor_here(a, name, 0)) { return a; }
-    return YAnchors {.names = a.names.concat([name]), .refs = a.refs.concat([ref]), .depth = a.depth, .handles = a.handles, .prefixes = a.prefixes};
+    return YAnchors {.names = a.names.concat([name]), .refs = a.refs.concat([ref]), .depth = a.depth, .handles = a.handles, .prefixes = a.prefixes, .nest = a.nest};
 }
 
 Bool y_anchor_here(YAnchors a, Str name, Int i) {
@@ -508,7 +523,8 @@ Int y_key_colon_at(Str text, Int i, Int seen, Int found) {
 // A sequence: one `- ` per line, each entry's value either on that line or
 // in the block indented under it.
 Result(YBlock, SerialError) y_seq_at(List(YLine) ls, Int i, Int stop, Int indent, YAnchors a) {
-    return y_seq_items(ls, i, stop, indent, a, []);
+    YAnchors inside = y_nested(a)?;
+    return y_seq_items(ls, i, stop, indent, inside, []);
 }
 
 Result(YBlock, SerialError) y_seq_items(List(YLine) ls, Int i, Int stop, Int indent, YAnchors a, List(YNode) acc) {
@@ -598,8 +614,9 @@ Result(YBlock, SerialError) y_scalar_line(List(YLine) ls, Int i, Int stop, Int i
 // A mapping: one `key: value` per line, with the value either on that line
 // or in the block indented under it.
 Result(YBlock, SerialError) y_map_at(List(YLine) ls, Int i, Int stop, Int indent, YAnchors a) {
+    YAnchors inside = y_nested(a)?;
     Map(Str, Bool) none = {};
-    return y_map_pairs(ls, i, stop, indent, a, [], none);
+    return y_map_pairs(ls, i, stop, indent, inside, [], none);
 }
 
 // `keys` holds the keys read so far, so a key set twice is found without a
@@ -929,7 +946,7 @@ Result(YNode, SerialError) y_alias(List(YLine) ls, Str rest, Int i, YAnchors a) 
     if (a.depth > 32) { return Err(syntax_error("the anchor `&" + name + "` refers to itself")); }
     YAnchorRef ref = a.refs[at];
     Int n = ls.len();
-    YAnchors deeper = YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth + 1, .handles = a.handles, .prefixes = a.prefixes};
+    YAnchors deeper = YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth + 1, .handles = a.handles, .prefixes = a.prefixes, .nest = a.nest};
     Result(YBlock, SerialError) block = y_anchor_node(ls, ref, n, deeper);
     if (Err(e) = block) { return Err(e); }
     if (Ok(b) = block) { return Ok(b.node); }
@@ -1361,8 +1378,11 @@ Result(YNode, SerialError) y_flow_at(List(YLine) ls, Str s, Int i, Int depth, YA
     Int j = y_space_end(s, i);
     if (j >= str_len(s)) { return Err(syntax_error("a flow collection that never closes")); }
     Int c = str_char_at(s, j);
-    if (c == 91) { return y_flow_seq(ls, s, j + 1, depth, a); }
-    if (c == 123) { return y_flow_map(ls, s, j + 1, depth, a); }
+    if (c == 91 || c == 123) {
+        YAnchors inside = y_nested(a)?;
+        if (c == 91) { return y_flow_seq(ls, s, j + 1, depth, inside); }
+        return y_flow_map(ls, s, j + 1, depth, inside);
+    }
     return y_flow_scalar(ls, s, j, depth, a);
 }
 

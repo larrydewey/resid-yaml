@@ -1,4 +1,13 @@
 ok   keys/many
 ok   keys/twice
 ok   keys/twice in flow
+ok   depth/limit is 64
+ok   depth/64 flow
+ok   depth/65 flow
+ok   depth/100000 flow
+ok   depth/65 flow maps
+ok   depth/64 block
+ok   depth/65 block
+ok   depth/65 keys
+ok   depth/through an alias
 exit 0
