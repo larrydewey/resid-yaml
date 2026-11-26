@@ -10,4 +10,11 @@ ok   depth/64 block
 ok   depth/65 block
 ok   depth/65 keys
 ok   depth/through an alias
+ok   aliases/limit
+ok   aliases/laughs 4
+ok   aliases/laughs 5
+ok   aliases/laughs 9
+ok   aliases/many of one
+ok   aliases/many anchors
+ok   aliases/self
 exit 0

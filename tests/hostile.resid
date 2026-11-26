@@ -63,6 +63,15 @@ Int main() {
     check_text("depth/65 keys", count_of(numbered("", "", 0, 0, StrBuf()) + y_indented(65)), "nested deeper than 64 levels");
     check_text("depth/through an alias", count_of("a: &a " + rep("[", 40, StrBuf()) + rep("]", 40, StrBuf()) + "\nb: " + rep("[", 30, StrBuf()) + "*a" + rep("]", 30, StrBuf()) + "\n"), "nested deeper than 64 levels");
 
+    // What aliases repeat is bounded before anything is parsed.
+    check("aliases/limit", yaml_max_alias_work() == 1000000);
+    check_text("aliases/laughs 4", count_of(laughs(4, 10)), "5 entries");
+    check_text("aliases/laughs 5", count_of(laughs(5, 10)), "the aliases expand past 1000000");
+    check_text("aliases/laughs 9", count_of(laughs(9, 10)), "the aliases expand past 1000000");
+    check_text("aliases/many of one", count_of("a: &a x\n" + numbered("k", ": *a\n", 0, 3000, StrBuf())), "3001 entries");
+    check_text("aliases/many anchors", count_of(numbered("a", ": &x", 0, 5000, StrBuf()) + "\n"), "1 entries");
+    check_text("aliases/self", count_of("a: &a [*a]\n"), "the anchor `&a` refers to itself");
+
     return 0;
 }
 

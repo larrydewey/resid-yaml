@@ -250,10 +250,20 @@ type YAnchorRef = { Str name; Int line; Int column; };
 // The document's own names: its anchors, and the tag handles its `%TAG`
 // directives have declared, which say what a `!e!name` tag stands for.
 // `nest` is how many collections hold the node being read, which
-// yaml_max_depth bounds.
-type YAnchors = { List(Str) names; List(YAnchorRef) refs; Int depth; List(Str) handles; List(Str) prefixes; Int nest; };
+// yaml_max_depth bounds. `index` finds an anchor's place in `names` and
+// `refs` without a walk of them, and `lines` are the stream's own lines,
+// which an alias reads its anchor's node from wherever it is written.
+type YAnchors = { List(Str) names; List(YAnchorRef) refs; Int depth; List(Str) handles; List(Str) prefixes; Int nest; Map(Str, Int) index; List(YLine) lines; };
 
-pub YAnchors y_anchors() { return YAnchors {.names = [], .refs = [], .depth = 0, .handles = [], .prefixes = [], .nest = 0}; }
+pub YAnchors y_anchors() {
+    Map(Str, Int) none = {};
+    return YAnchors {.names = [], .refs = [], .depth = 0, .handles = [], .prefixes = [], .nest = 0, .index = none, .lines = []};
+}
+
+// The table over the stream's lines, which aliases read from.
+YAnchors y_anchors_over(YAnchors a, List(YLine) ls) {
+    return YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth, .handles = a.handles, .prefixes = a.prefixes, .nest = a.nest, .index = a.index, .lines = ls};
+}
 
 /// How deeply sequences and mappings may nest in a document `from_yaml`
 /// and `yaml_docs` read, block and flow alike: 64. One nested deeper is a
@@ -265,12 +275,12 @@ pub Int yaml_max_depth() { return 64; }
 // One collection deeper: past the limit it is refused.
 Result(YAnchors, SerialError) y_nested(YAnchors a) {
     if (a.nest >= yaml_max_depth()) { return Err(syntax_error(f"nested deeper than {yaml_max_depth()} levels")); }
-    return Ok(YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth, .handles = a.handles, .prefixes = a.prefixes, .nest = a.nest + 1});
+    return Ok(YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth, .handles = a.handles, .prefixes = a.prefixes, .nest = a.nest + 1, .index = a.index, .lines = a.lines});
 }
 
 // With one more tag handle, which a `%TAG` directive declares.
 YAnchors y_handle_add(YAnchors a, Str handle, Str prefix) {
-    return YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth, .handles = a.handles.concat([handle]), .prefixes = a.prefixes.concat([prefix]), .nest = a.nest};
+    return YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth, .handles = a.handles.concat([handle]), .prefixes = a.prefixes.concat([prefix]), .nest = a.nest, .index = a.index, .lines = a.lines};
 }
 
 // The prefix a tag handle means, or "" when the document has not declared
@@ -326,22 +336,14 @@ Int y_anchor_column(Str s, Int j) {
     return at;
 }
 
+// The first anchor of a name is the one its aliases mean.
 YAnchors y_anchor_add(YAnchors a, Str name, YAnchorRef ref) {
-    if (y_anchor_here(a, name, 0)) { return a; }
-    return YAnchors {.names = a.names.concat([name]), .refs = a.refs.concat([ref]), .depth = a.depth, .handles = a.handles, .prefixes = a.prefixes, .nest = a.nest};
+    if (a.index.contains(name)) { return a; }
+    return YAnchors {.names = a.names.concat([name]), .refs = a.refs.concat([ref]), .depth = a.depth, .handles = a.handles, .prefixes = a.prefixes, .nest = a.nest, .index = a.index.insert(name, a.names.len()), .lines = a.lines};
 }
 
-Bool y_anchor_here(YAnchors a, Str name, Int i) {
-    if (i >= a.names.len()) { return false; }
-    if (a.names[i] == name) { return true; }
-    return y_anchor_here(a, name, i + 1);
-}
-
-Int y_anchor_index(YAnchors a, Str name, Int i, Int found) {
-    if (i >= a.names.len()) { return found; }
-    if (a.names[i] == name) { return i; }
-    return y_anchor_index(a, name, i + 1, found);
-}
+// The place of an anchor in the table, or `found`.
+Int y_anchor_index(YAnchors a, Str name, Int i, Int found) { return a.index.get(name) else { found }; }
 
 // ─── Properties: a tag and an anchor ─────────────────────────────────
 
@@ -677,7 +679,6 @@ Int y_explicit_value_at(List(YLine) ls, Int k, Int stop, Int indent) {
     return j;
 }
 
-
 // The text of a key: a plain key as written, a quoted one unquoted.
 // A key that is written after a `?`, where the text is trimmed at its end.
 Str y_key_trim(Str text, Int i, Int colon) {
@@ -945,9 +946,9 @@ Result(YNode, SerialError) y_alias(List(YLine) ls, Str rest, Int i, YAnchors a) 
     if (at < 0) { return Err(syntax_error("the alias `*" + name + "` has no anchor")); }
     if (a.depth > 32) { return Err(syntax_error("the anchor `&" + name + "` refers to itself")); }
     YAnchorRef ref = a.refs[at];
-    Int n = ls.len();
-    YAnchors deeper = YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth + 1, .handles = a.handles, .prefixes = a.prefixes, .nest = a.nest};
-    Result(YBlock, SerialError) block = y_anchor_node(ls, ref, n, deeper);
+    Int n = a.lines.len();
+    YAnchors deeper = YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth + 1, .handles = a.handles, .prefixes = a.prefixes, .nest = a.nest, .index = a.index, .lines = a.lines};
+    Result(YBlock, SerialError) block = y_anchor_node(a.lines, ref, n, deeper);
     if (Err(e) = block) { return Err(e); }
     if (Ok(b) = block) { return Ok(b.node); }
     return Err(custom_error("unreachable"));
@@ -966,8 +967,26 @@ Result(YBlock, SerialError) y_anchor_node(List(YLine) ls, YAnchorRef ref, Int st
         return y_node_under(ls, ref.line, stop, ln.indent, a);
     }
     YLine moved = YLine {.indent = at, .text = own, .number = ln.number, .end = ln.end, .blank = false, .tabbed = ln.tabbed};
-    List(YLine) moved_lines = y_set_line(ls, ref.line, moved);
-    return y_node_at(moved_lines, ref.line, stop, at, a);
+    return y_node_alone(ls, ref.line, y_block_end(ls, ref.line + 1, stop, ln.indent), moved, at, a);
+}
+
+// The node that starts on line k, read from `moved` -- line k rewritten
+// to start at its own column -- and the lines under it up to `e`, which is
+// as far as it can reach. The lines are copied that far and no further,
+// so reading one entry costs what the entry holds, not the whole stream.
+Result(YBlock, SerialError) y_node_alone(List(YLine) ls, Int k, Int e, YLine moved, Int at, YAnchors a) {
+    List(YLine) own = [moved].concat(ls[k + 1..e]);
+    YBlock b = y_node_at(own, 0, e - k, at, a)?;
+    return Ok(YBlock {.node = b.node, .upto = b.upto + k});
+}
+
+// The first line from i that comes back to column `indent` or further out,
+// which ends a block whose first line is written there: every line it
+// holds is written deeper.
+Int y_block_end(List(YLine) ls, Int i, Int stop, Int indent) {
+    if (i >= stop) { return stop; }
+    if (!ls[i].blank && ls[i].indent <= indent) { return i; }
+    return y_block_end(ls, i + 1, stop, indent);
 }
 
 // A node with an anchor on it is the node itself: the anchor is a name for
@@ -1158,6 +1177,174 @@ Str y_chomp_end(Str body, Int i) {
     return str_slice(body, 0, i + 1);
 }
 
+// ─── What aliases cost ───────────────────────────────────────────────
+//
+// An alias is the node its anchor names, read again where the alias is.
+// An anchored node may hold aliases of its own, so each level multiplies:
+// nine lines of ten aliases each name a node of 10^9 entries (the "billion
+// laughs"). Before a stream is parsed, what its aliases would make the
+// parser read is worked out from the lines alone, and a stream past
+// yaml_max_alias_work() is refused before any of that work is done.
+//
+// An anchor on line L names at most the lines from L to the first one
+// written at L's column or further out (more, for a flow collection still
+// open at the end of L), so its weight is the characters of those lines
+// plus a fixed 64 for reading a node at all, plus the weights of the
+// aliases written in them; the stream's cost is the weight of every alias
+// in it. Counting every `*name` of a known
+// anchor, wherever it stands, overcounts and never undercounts. The
+// weights are found by repeating that sum until it settles: aliases may
+// nest 32 deep, so 34 rounds are enough, and a weight never passes the
+// limit by more than the limit itself, so nothing overflows.
+
+/// The most aliases may make the parser read in one stream: 1,000,000,
+/// counted as the characters of every node an alias repeats plus 64 for
+/// each, the nodes its own aliases repeat included. A few hundred aliases
+/// of ordinary nodes cost a few tens of thousands; a stream past the limit
+/// is a syntax error ("the aliases expand past 1000000") before it is
+/// parsed.
+pub Int yaml_max_alias_work() { return 1000000; }
+
+Int y_alias_each() { return 64; }
+
+Result(Int, SerialError) y_alias_check(List(YLine) ls, YAnchors a) {
+    Int na = a.names.len();
+    if (na == 0) { return Ok(0); }
+    Int n = ls.len();
+    List(List(Int)) refs = y_line_refs(ls, 0, a, ListBuf());
+    ListBuf(Int) c0 = ListBuf();
+    List(Int) chars = y_char_sums(ls, 0, 0, c0.push(0));
+    List(Int) starts = y_anchor_starts(a.refs, 0, n, ListBuf());
+    List(Bool) open = y_flow_open(ls, 0, ListBuf());
+    List(Int) blocks = y_line_ends(ls, n - 1, YsNil, ListBuf());
+    List(Int) ends = y_anchor_ends(blocks, open, starts, 0, n, ListBuf());
+    List(Int) w0 = y_own_weights(starts, ends, chars, 0, ListBuf());
+    List(Int) w = y_settle(refs, starts, ends, chars, w0, 0);
+    Int total = y_refs_weight(refs, w, 0, 0);
+    if (total > yaml_max_alias_work()) { return Err(syntax_error(f"the aliases expand past {yaml_max_alias_work()}")); }
+    return Ok(total);
+}
+
+Int y_cap(Int v) { return if (v > yaml_max_alias_work() + 1) { yaml_max_alias_work() + 1 } else { v }; }
+
+// For each line, the anchors its `*name`s name.
+List(List(Int)) y_line_refs(List(YLine) ls, Int j, YAnchors a, ListBuf(List(Int)) acc) {
+    if (j >= ls.len()) { return acc.finish(); }
+    return y_line_refs(ls, j + 1, a, acc.push(y_refs_in(ls[j].text, 0, a, ListBuf())));
+}
+
+List(Int) y_refs_in(Str s, Int i, YAnchors a, ListBuf(Int) acc) {
+    if (i >= str_len(s)) { return acc.finish(); }
+    if (str_char_at(s, i) != 42) { return y_refs_in(s, i + 1, a, acc); }
+    Int j = y_word_end(s, i + 1);
+    Int at = a.index.get(str_slice(s, i + 1, j)) else { 0 - 1 };
+    if (at < 0) { return y_refs_in(s, j, a, acc); }
+    return y_refs_in(s, j, a, acc.push(at));
+}
+
+// chars[j] is the characters of the lines before j, so lines [l, e) hold
+// chars[e] - chars[l].
+List(Int) y_char_sums(List(YLine) ls, Int j, Int sum, ListBuf(Int) acc) {
+    if (j >= ls.len()) { return acc.finish(); }
+    Int next = sum + str_len(ls[j].text) + 1;
+    return y_char_sums(ls, j + 1, next, acc.push(next));
+}
+
+List(Int) y_anchor_starts(List(YAnchorRef) refs, Int x, Int n, ListBuf(Int) acc) {
+    if (x >= refs.len()) { return acc.finish(); }
+    Int line = refs[x].line;
+    return y_anchor_starts(refs, x + 1, n, acc.push(if (line < n) { line } else { n }));
+}
+
+// For each line, whether it leaves a flow collection open, measured once
+// per line however many anchors are on it.
+List(Bool) y_flow_open(List(YLine) ls, Int j, ListBuf(Bool) acc) {
+    if (j >= ls.len()) { return acc.finish(); }
+    return y_flow_open(ls, j + 1, acc.push(y_flow_depth(ls[j].text, 0, 0) > 0));
+}
+
+// For each line j, the first line after it written at j's column or
+// further out (y_block_end from j + 1), all of them in one pass from the
+// end: the stack holds the lines after j that no line between them and j
+// comes out further than, so each line is pushed and popped once.
+type YStack = YsNil | YsCons(YsCell);
+type YsCell = { Int line; Int indent; YStack below; };
+
+List(Int) y_line_ends(List(YLine) ls, Int j, YStack st, ListBuf(Int) acc) {
+    if (j < 0) { return acc.finish().reverse(); }
+    if (ls[j].blank) { return y_line_ends(ls, j - 1, st, acc.push(ls.len())); }
+    YStack kept = y_pop_deeper(st, ls[j].indent);
+    Int end = match kept { YsNil => ls.len(), YsCons(c) => c.line };
+    return y_line_ends(ls, j - 1, YsCons(YsCell {.line = j, .indent = ls[j].indent, .below = kept}), acc.push(end));
+}
+
+YStack y_pop_deeper(YStack st, Int indent) {
+    return match st {
+        YsNil => st,
+        YsCons(c) => if (c.indent > indent) { y_pop_deeper(c.below, indent) } else { st }
+    };
+}
+
+// Where each anchor's node can reach to, exclusive.
+List(Int) y_anchor_ends(List(Int) blocks, List(Bool) open, List(Int) starts, Int x, Int n, ListBuf(Int) acc) {
+    if (x >= starts.len()) { return acc.finish(); }
+    Int l = starts[x];
+    if (l >= n) { return y_anchor_ends(blocks, open, starts, x + 1, n, acc.push(n)); }
+    Int block = blocks[l];
+    // A flow collection is gathered over as many as 100 more lines,
+    // whatever their indentation.
+    Int flow = if (open[l]) { y_min(n, l + 102) } else { l + 1 };
+    return y_anchor_ends(blocks, open, starts, x + 1, n, acc.push(if (flow > block) { flow } else { block }));
+}
+
+Int y_min(Int a, Int b) { return if (a < b) { a } else { b }; }
+
+List(Int) y_own_weights(List(Int) starts, List(Int) ends, List(Int) chars, Int x, ListBuf(Int) acc) {
+    if (x >= starts.len()) { return acc.finish(); }
+    return y_own_weights(starts, ends, chars, x + 1, acc.push(y_cap(chars[ends[x]] - chars[starts[x]] + y_alias_each())));
+}
+
+// One round after another until the weights settle, 34 at most.
+List(Int) y_settle(List(List(Int)) refs, List(Int) starts, List(Int) ends, List(Int) chars, List(Int) w, Int round) {
+    if (round >= 34) { return w; }
+    ListBuf(Int) b0 = ListBuf();
+    List(Int) below = y_ref_sums(refs, w, 0, 0, b0.push(0));
+    List(Int) next = y_round(starts, ends, chars, below, 0, ListBuf());
+    if (y_same_ints(next, w, 0)) { return w; }
+    return y_settle(refs, starts, ends, chars, next, round + 1);
+}
+
+Bool y_same_ints(List(Int) a, List(Int) b, Int i) {
+    if (i >= a.len()) { return true; }
+    if (a[i] != b[i]) { return false; }
+    return y_same_ints(a, b, i + 1);
+}
+
+// below[j] is the weight of the aliases on the lines before j.
+List(Int) y_ref_sums(List(List(Int)) refs, List(Int) w, Int j, Int sum, ListBuf(Int) acc) {
+    if (j >= refs.len()) { return acc.finish(); }
+    Int next = sum + y_weight_of(refs[j], w, 0, 0);
+    return y_ref_sums(refs, w, j + 1, next, acc.push(next));
+}
+
+Int y_weight_of(List(Int) xs, List(Int) w, Int i, Int sum) {
+    if (i >= xs.len()) { return sum; }
+    return y_weight_of(xs, w, i + 1, y_cap(sum + w[xs[i]]));
+}
+
+List(Int) y_round(List(Int) starts, List(Int) ends, List(Int) chars, List(Int) below, Int x, ListBuf(Int) acc) {
+    if (x >= starts.len()) { return acc.finish(); }
+    Int l = starts[x];
+    Int e = ends[x];
+    Int own = chars[e] - chars[l] + y_alias_each();
+    return y_round(starts, ends, chars, below, x + 1, acc.push(y_cap(own + below[e] - below[l])));
+}
+
+Int y_refs_weight(List(List(Int)) refs, List(Int) w, Int j, Int sum) {
+    if (j >= refs.len()) { return sum; }
+    return y_refs_weight(refs, w, j + 1, y_cap(sum + y_weight_of(refs[j], w, 0, 0)));
+}
+
 // ─── Documents ───────────────────────────────────────────────────────
 
 // One document of a stream. A stream is a document, or several separated
@@ -1168,7 +1355,10 @@ pub Result(List(YDoc), SerialError) yaml_docs(Str in) {
     if (Ok(ls) = lines) {
         Result(YAnchors, SerialError) a = y_anchor_scan(ls, 0, ls.len(), y_anchors());
         if (Err(e) = a) { return Err(e); }
-        if (Ok(anchors) = a) { return y_docs_at(ls, 0, ls.len(), anchors, [], false, 0); }
+        if (Ok(anchors) = a) {
+            Int work = y_alias_check(ls, anchors)?;
+            return y_docs_at(ls, 0, ls.len(), y_anchors_over(anchors, ls), [], false, 0);
+        }
     }
     return Err(custom_error("unreachable"));
 }
