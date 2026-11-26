@@ -17,4 +17,6 @@ ok   aliases/laughs 9
 ok   aliases/many of one
 ok   aliases/many anchors
 ok   aliases/self
+ok   entries/many
+ok   entries/nested
 exit 0

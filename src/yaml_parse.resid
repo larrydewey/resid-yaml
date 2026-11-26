@@ -574,8 +574,7 @@ Result(YBlock, SerialError) y_node_from(List(YLine) ls, Int k, Int stop, Int ind
     // after the `- `, so the lines under it line up with it.
     Int at = y_value_column(ls[k].text, indent);
     YLine moved = YLine {.indent = at, .text = text, .number = ln.number, .end = ln.end, .blank = false, .tabbed = ln.tabbed};
-    List(YLine) moved_lines = y_set_line(ls, k, moved);
-    return y_node_at(moved_lines, k, stop, at, a);
+    return y_node_alone(ls, k, y_block_end(ls, k + 1, stop, ln.indent), moved, at, a);
 }
 
 // The column a line's value starts at: past a leading `- `, or the line's
@@ -585,9 +584,11 @@ pub Int y_value_column(Str text, Int indent) {
     return indent;
 }
 
+// The lines with line k replaced: one copy of the list, not two slices and
+// two joins.
 List(YLine) y_set_line(List(YLine) ls, Int k, YLine ln) {
     if (k >= ls.len()) { return ls; }
-    return ls[0..k].concat([ln]).concat(ls[k + 1..ls.len()]);
+    return ls.with(k, ln);
 }
 
 // The block that starts under line k, if there is one: a line written at

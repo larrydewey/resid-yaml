@@ -72,6 +72,11 @@ Int main() {
     check_text("aliases/many anchors", count_of(numbered("a", ": &x", 0, 5000, StrBuf()) + "\n"), "1 entries");
     check_text("aliases/self", count_of("a: &a [*a]\n"), "the anchor `&a` refers to itself");
 
+    // `- key: value` entries are read one by one, not by copying
+    // the whole document for each.
+    check_text("entries/many", count_of(numbered("- a: ", "\n", 0, 60000, StrBuf())), "60000 items");
+    check_text("entries/nested", shown("- a: 1\n  b: [2]\n- - c: 3\n    d: 4\n  - 5\n"), "[{\"a\": 1, \"b\": [2]}, [{\"c\": 3, \"d\": 4}, 5]]");
+
     return 0;
 }
 
