@@ -97,23 +97,20 @@ pub Int y_next_line(Str in, Int i) {
     return stop + 1;
 }
 
-YLine y_line_tabbed(YLine ln, Bool yes) {
-    return YLine {.indent = ln.indent, .text = ln.text, .number = ln.number, .end = ln.end, .blank = ln.blank, .tabbed = yes};
-}
-
 YLine y_line_of(Str in, Int start, Int stop, Int number) {
     Int indent = y_indent(in, start, stop, 0);
     Int body = y_skip_blank(in, start + indent, stop);
     Str text = str_slice(in, body, stop);
     Str trimmed = y_strip_comment(text, 0, StrBuf());
     Str clean = str_slice(trimmed, 0, y_rtrim_end(trimmed, str_len(trimmed) - 1));
-    return y_line_tabbed(YLine {
+    return YLine {
         .indent = indent,
         .text = clean,
         .number = number,
         .end = stop,
-        .blank = str_len(clean) == 0
-    }, y_tabbed_before(in, start, stop));
+        .blank = str_len(clean) == 0,
+        .tabbed = y_tabbed_before(in, start, stop)
+    };
 }
 
 // Whether the indentation before the text of a line has a tab in it.
@@ -316,7 +313,7 @@ Int y_anchor_column(Str s, Int j) {
 
 YAnchors y_anchor_add(YAnchors a, Str name, YAnchorRef ref) {
     if (y_anchor_here(a, name, 0)) { return a; }
-    return YAnchors {.names = a.names.concat([name]), .refs = a.refs.concat([ref]), .depth = a.depth};
+    return YAnchors {.names = a.names.concat([name]), .refs = a.refs.concat([ref]), .depth = a.depth, .handles = a.handles, .prefixes = a.prefixes};
 }
 
 Bool y_anchor_here(YAnchors a, Str name, Int i) {
@@ -558,7 +555,7 @@ Result(YBlock, SerialError) y_node_from(List(YLine) ls, Int k, Int stop, Int ind
     // The node's own column is where its text starts, which for an entry is
     // after the `- `, so the lines under it line up with it.
     Int at = y_value_column(ls[k].text, indent);
-    YLine moved = YLine {.indent = at, .text = text, .number = ln.number, .end = ln.end, .blank = false};
+    YLine moved = YLine {.indent = at, .text = text, .number = ln.number, .end = ln.end, .blank = false, .tabbed = ln.tabbed};
     List(YLine) moved_lines = y_set_line(ls, k, moved);
     return y_node_at(moved_lines, k, stop, at, a);
 }
@@ -934,7 +931,7 @@ Result(YNode, SerialError) y_alias(List(YLine) ls, Str rest, Int i, YAnchors a) 
     if (a.depth > 32) { return Err(syntax_error("the anchor `&" + name + "` refers to itself")); }
     YAnchorRef ref = a.refs[at];
     Int n = ls.len();
-    YAnchors deeper = YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth + 1};
+    YAnchors deeper = YAnchors {.names = a.names, .refs = a.refs, .depth = a.depth + 1, .handles = a.handles, .prefixes = a.prefixes};
     Result(YBlock, SerialError) block = y_anchor_node(ls, ref, n, deeper);
     if (Err(e) = block) { return Err(e); }
     if (Ok(b) = block) { return Ok(b.node); }
@@ -953,7 +950,7 @@ Result(YBlock, SerialError) y_anchor_node(List(YLine) ls, YAnchorRef ref, Int st
     if (str_len(own) == 0 || str_char_at(own, 0) == 38 || str_char_at(own, 0) == 33) {
         return y_node_under(ls, ref.line, stop, ln.indent, a);
     }
-    YLine moved = YLine {.indent = at, .text = own, .number = ln.number, .end = ln.end, .blank = false};
+    YLine moved = YLine {.indent = at, .text = own, .number = ln.number, .end = ln.end, .blank = false, .tabbed = ln.tabbed};
     List(YLine) moved_lines = y_set_line(ls, ref.line, moved);
     return y_node_at(moved_lines, ref.line, stop, at, a);
 }
