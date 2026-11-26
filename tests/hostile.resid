@@ -77,6 +77,12 @@ Int main() {
     check_text("entries/many", count_of(numbered("- a: ", "\n", 0, 60000, StrBuf())), "60000 items");
     check_text("entries/nested", shown("- a: 1\n  b: [2]\n- - c: 3\n    d: 4\n  - 5\n"), "[{\"a\": 1, \"b\": [2]}, [{\"c\": 3, \"d\": 4}, 5]]");
 
+    // Exponents past a double's range.
+    check_text("float/1e500", shown("a: 1e500\n"), "{\"a\": inf}");
+    check_text("float/1e-500", shown("a: 1e-500\n"), "{\"a\": 0.0}");
+    check_text("float/0e500", shown("a: 0e500\n"), "{\"a\": 0.0}");
+    check_text("float/exponent past Int", shown("a: 1e99999999999999999999999\n"), "{\"a\": inf}");
+    check_text("float/-1e500", shown("a: -1e500\n"), "{\"a\": -inf}");
     return 0;
 }
 

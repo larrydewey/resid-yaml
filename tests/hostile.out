@@ -19,4 +19,9 @@ ok   aliases/many anchors
 ok   aliases/self
 ok   entries/many
 ok   entries/nested
+ok   float/1e500
+ok   float/1e-500
+ok   float/0e500
+ok   float/exponent past Int
+ok   float/-1e500
 exit 0

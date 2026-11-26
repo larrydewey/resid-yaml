@@ -350,13 +350,16 @@ Int y_exp_at(Str s, Int i, Int seen) {
     return str_len(s);
 }
 
-// The exponent's digits, with the sign they may carry.
+// The exponent's digits, with the sign they may carry. Past 100000 the
+// float is infinite or zero whatever follows, so the count stops growing
+// there rather than overflow.
 Int y_exp_digits(Str s, Int i, Int acc, Int seen) {
     if (i >= str_len(s)) { return acc; }
     Int c = str_char_at(s, i);
     if (c == 45) { return 0 - y_exp_digits(s, i + 1, 0, seen); }
     if (c == 43) { return y_exp_digits(s, i + 1, acc, seen); }
     if (!y_is_digit(c)) { return acc; }
+    if (acc > 100000) { return y_exp_digits(s, i + 1, acc, seen + 1); }
     return y_exp_digits(s, i + 1, acc * 10 + y_hex_value(c), seen + 1);
 }
 
@@ -378,12 +381,11 @@ Float y_signed(Str s, Float v) {
     return v;
 }
 
-// Ten to the power of `n`, which is the exponent's job. A power this large
-// is a float at its limit, and a power this small is zero, so both stop
-// there.
+// Ten to the power of `n`, which is the exponent's job. Past 400 places
+// the power is infinite or zero already, so the scaling stops there and
+// applies it: `1e500` is infinity and `1e-500` zero, and zero stays zero.
 Float y_scale_float(Float m, Int n, Int i, Float acc) {
-    if (i >= 400) { return m; }
-    if (n == 0) { return m * acc; }
+    if (n == 0 || i >= 400) { return if (m == 0.0) { m } else { m * acc }; }
     if (n > 0) { return y_scale_float(m, n - 1, i + 1, acc * 10.0); }
     return y_scale_float(m, n + 1, i + 1, acc * 0.1);
 }
