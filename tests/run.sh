@@ -39,7 +39,7 @@ compile "$SERIAL/tools/resid-derive.resid" "$WORK/resid-derive" || { echo "FAIL 
     echo "FAIL resid-derive on tests/model.resid"; exit 1;
 }
 
-for src in vectors roundtrip errors value derive; do
+for src in vectors roundtrip errors value derive hostile; do
     want="$ROOT/tests/$src.out"
     bin="$WORK/$src"
     if ! compile "$ROOT/tests/$src.resid" "$bin"; then

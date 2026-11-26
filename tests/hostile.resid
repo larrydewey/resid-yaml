@@ -1,0 +1,64 @@
+// hostile.resid — documents an attacker would send. Every check here
+// failed, aborted or took seconds before the fix it pins.
+
+import "../src/yaml.resid";
+import "resid-serial/value.resid";
+import "check.resid";
+
+Str rep(Str s, Int n, StrBuf b) {
+    if (n <= 0) { return b.finish(); }
+    return rep(s, n - 1, b.push(s));
+}
+
+// a + i + z for i in 0..n, one after another.
+Str numbered(Str a, Str z, Int i, Int n, StrBuf b) {
+    if (i >= n) { return b.finish(); }
+    return numbered(a, z, i + 1, n, b.push(a).push(f"{i}").push(z));
+}
+
+// The billion laughs: line i holds `fan` aliases of line i - 1.
+Str laughs(Int levels, Int fan) { return laughs_at(1, levels, fan, StrBuf().push("l0: &l0 [x]\n")); }
+
+Str laughs_at(Int i, Int levels, Int fan, StrBuf b) {
+    if (i > levels) { return b.finish(); }
+    Str refs = rep(f"*l{i - 1}, ", fan - 1, StrBuf()) + f"*l{i - 1}";
+    return laughs_at(i + 1, levels, fan, b.push(f"l{i}: &l{i} [").push(refs).push("]\n"));
+}
+
+// The message of a failed decode, or how many entries the top holds.
+Str count_of(Str text) {
+    Result(Value, SerialError) r = from_yaml(text);
+    if (Err(e) = r) { return e.msg; }
+    if (Ok(v) = r) {
+        return match v {
+            VMap(es) => f"{es.len()} entries",
+            VSeq(xs) => f"{xs.len()} items",
+            _ => show_value(v)
+        };
+    }
+    return "unreachable";
+}
+
+Str shown(Str text) {
+    Result(Value, SerialError) r = from_yaml(text);
+    if (Err(e) = r) { return e.msg; }
+    if (Ok(v) = r) { return show_value(v); }
+    return "unreachable";
+}
+
+Int main() {
+    // Many keys: each was compared with every key before it.
+    check_text("keys/many", count_of(numbered("k", ": 1\n", 0, 30000, StrBuf())), "30000 entries");
+    check_text("keys/twice", count_of(numbered("k", ": 1\n", 0, 2000, StrBuf()) + "k7: 2\n"), "the key `k7` is set twice on line 2001");
+    check_text("keys/twice in flow", count_of("{" + numbered("k", ": 1, ", 0, 2000, StrBuf()) + "k7: 2}"), "the key `k7` is set twice");
+
+    return 0;
+}
+
+// a:\n  a:\n    a: ... n deep, then 1.
+Str y_indented(Int n) { return y_indented_at(0, n, StrBuf()); }
+
+Str y_indented_at(Int i, Int n, StrBuf b) {
+    if (i >= n) { return b.push(rep("  ", n, StrBuf())).push("x: 1\n").finish(); }
+    return y_indented_at(i + 1, n, b.push(rep("  ", i, StrBuf())).push("a:\n"));
+}

@@ -67,7 +67,8 @@ pub List(YEntryV) yv_pairs(YValue v) {
 // like a null, a bool, an int or a float.
 pub Result(YValue, SerialError) y_resolve(YNode n) {
     if (y_is_seq(n)) { return y_resolve_seq(n, 0, []); }
-    if (y_is_map(n)) { return y_resolve_map(n, 0, []); }
+    Map(Str, Bool) none = {};
+    if (y_is_map(n)) { return y_resolve_map(n, 0, [], none); }
     return y_resolve_scalar(n);
 }
 
@@ -79,23 +80,19 @@ Result(YValue, SerialError) y_resolve_seq(YNode n, Int i, List(YValue) acc) {
     return Err(custom_error("unreachable"));
 }
 
-Result(YValue, SerialError) y_resolve_map(YNode n, Int i, List(YEntryV) acc) {
+// `keys` holds the keys resolved so far, so a key set twice is found
+// without a walk of the entries.
+Result(YValue, SerialError) y_resolve_map(YNode n, Int i, List(YEntryV) acc, Map(Str, Bool) keys) {
     if (i >= y_pairs(n).len()) { return Ok(YMapV(acc)); }
     YPair p = y_pairs(n)[i];
-    if (y_key_taken(acc, p.key, 0)) { return Err(syntax_error("the key `" + p.key + "` is set twice")); }
+    if (keys.contains(p.key)) { return Err(syntax_error("the key `" + p.key + "` is set twice")); }
     Result(YValue, SerialError) v = y_resolve(p.value);
     if (Err(e) = v) { return Err(e); }
     if (Ok(value) = v) {
         YEntryV entry = YEntryV {.key = p.key, .value = value};
-        return y_resolve_map(n, i + 1, acc.concat([entry]));
+        return y_resolve_map(n, i + 1, acc.concat([entry]), keys.insert(p.key, true));
     }
     return Err(custom_error("unreachable"));
-}
-
-Bool y_key_taken(List(YEntryV) entries, Str key, Int i) {
-    if (i >= entries.len()) { return false; }
-    if (entries[i].key == key) { return true; }
-    return y_key_taken(entries, key, i + 1);
 }
 
 // A scalar, with its tag deciding what it is.

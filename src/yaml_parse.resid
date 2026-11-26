@@ -598,10 +598,13 @@ Result(YBlock, SerialError) y_scalar_line(List(YLine) ls, Int i, Int stop, Int i
 // A mapping: one `key: value` per line, with the value either on that line
 // or in the block indented under it.
 Result(YBlock, SerialError) y_map_at(List(YLine) ls, Int i, Int stop, Int indent, YAnchors a) {
-    return y_map_pairs(ls, i, stop, indent, a, []);
+    Map(Str, Bool) none = {};
+    return y_map_pairs(ls, i, stop, indent, a, [], none);
 }
 
-Result(YBlock, SerialError) y_map_pairs(List(YLine) ls, Int i, Int stop, Int indent, YAnchors a, List(YPair) acc) {
+// `keys` holds the keys read so far, so a key set twice is found without a
+// walk of the pairs.
+Result(YBlock, SerialError) y_map_pairs(List(YLine) ls, Int i, Int stop, Int indent, YAnchors a, List(YPair) acc, Map(Str, Bool) keys) {
     
     Int k = y_next_content(ls, i, stop);
     if (k >= stop || ls[k].indent < indent) { return Ok(YBlock {.node = y_map_node(acc), .upto = k}); }
@@ -609,18 +612,18 @@ Result(YBlock, SerialError) y_map_pairs(List(YLine) ls, Int i, Int stop, Int ind
     Str text = ls[k].text;
     // An explicit key: `? key` on one line and `: value` on the next, or
     // both on the same line after the `?`.
-    if (str_char_at(text, 0) == 63 && y_is_space_or_end(text, 1)) { return y_explicit_pair(ls, k, stop, indent, a, acc); }
+    if (str_char_at(text, 0) == 63 && y_is_space_or_end(text, 1)) { return y_explicit_pair(ls, k, stop, indent, a, acc, keys); }
     Int colon = y_key_colon(text);
     if (colon < 0) { return Err(y_error(ls, k, "expected a `key: value` line")); }
     Str key = y_key_text(text, 0, colon);
     if (str_len(key) == 0) { return Err(y_error(ls, k, "a mapping key with nothing in it")); }
-    if (y_key_taken(acc, key, 0)) { return Err(y_error(ls, k, "the key `" + key + "` is set twice")); }
+    if (keys.contains(key)) { return Err(y_error(ls, k, "the key `" + key + "` is set twice")); }
     Int after = y_body_start(text, colon + 1, 0);
     Result(YBlock, SerialError) value = y_value_here(ls, k, stop, indent, after, a);
     if (Err(e) = value) { return Err(e); }
     if (Ok(b) = value) {
         YPair pair = YPair {.key = key, .key_tag = "", .value = b.node};
-        return y_map_pairs(ls, b.upto, stop, indent, a, acc.concat([pair]));
+        return y_map_pairs(ls, b.upto, stop, indent, a, acc.concat([pair]), keys.insert(key, true));
     }
     return Err(custom_error("unreachable"));
 }
@@ -629,7 +632,7 @@ YNode y_map_node(List(YPair) pairs) { return YMapNode(YEntries {.pairs = pairs, 
 
 // An explicit `? key` / `: value` pair. The key may be a collection of its
 // own, which is read from the block under the `?`.
-Result(YBlock, SerialError) y_explicit_pair(List(YLine) ls, Int k, Int stop, Int indent, YAnchors a, List(YPair) acc) {
+Result(YBlock, SerialError) y_explicit_pair(List(YLine) ls, Int k, Int stop, Int indent, YAnchors a, List(YPair) acc, Map(Str, Bool) keys) {
     Str text = ls[k].text;
     Str key = y_key_trim(text, 1, str_len(text));
     Int next = y_explicit_value_at(ls, k, stop, indent);
@@ -641,7 +644,7 @@ Result(YBlock, SerialError) y_explicit_pair(List(YLine) ls, Int k, Int stop, Int
     if (Err(e) = value) { return Err(e); }
     if (Ok(b) = value) {
         YPair pair = YPair {.key = key, .key_tag = "", .value = b.node};
-        return y_map_pairs(ls, b.upto, stop, indent, a, acc.concat([pair]));
+        return y_map_pairs(ls, b.upto, stop, indent, a, acc.concat([pair]), keys.insert(key, true));
     }
     return Err(custom_error("unreachable"));
 }
@@ -657,11 +660,6 @@ Int y_explicit_value_at(List(YLine) ls, Int k, Int stop, Int indent) {
     return j;
 }
 
-Bool y_key_taken(List(YPair) pairs, Str key, Int i) {
-    if (i >= pairs.len()) { return false; }
-    if (pairs[i].key == key) { return true; }
-    return y_key_taken(pairs, key, i + 1);
-}
 
 // The text of a key: a plain key as written, a quoted one unquoted.
 // A key that is written after a `?`, where the text is trimmed at its end.
